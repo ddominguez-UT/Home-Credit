@@ -1,0 +1,25 @@
+# Data files
+data/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.parquet
+
+# Saved model objects
+models/
+*.rds
+*.RData
+*.rda
+
+# Intermediate and generated files
+outputs/
+cache/
+tmp/
+*.zip
+
+# Local R / Positron files
+.Rhistory
+.Ruserdata
+.Rproj.user/
