@@ -1,0 +1,401 @@
+---
+title: "Home Credit Exploratory Data Analysis - Supplemental"
+author: "Diana Dominguez"
+date: last-modified
+engine: knitr
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: false
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+execute-dir: file
+execute:
+  echo: true
+  output: true
+  warning: false
+  error: false
+  cache: false
+editor: source
+---
+
+# Purpose
+
+This notebook audits the supplementary Home Credit tables before they are used
+for feature engineering. Each table is analyzed at its native grain and is not
+joined to the application tables until its keys and timing fields are checked.
+The outcome, `TARGET`, is used only for later modeling—not to construct any
+supplementary-table feature in this EDA.
+
+# Setup and data inventory
+
+```{r}
+#| label: setup
+#| echo: true
+#| output: true
+library(dplyr)
+library(readr)
+library(purrr)
+library(tidyr)
+library(stringr)
+library(scales)
+library(ggplot2)
+
+options(dplyr.summarise.inform = FALSE)
+
+files <- c(
+  application_train = "application_train.csv",
+  application_test = "application_test.csv",
+  bureau = "bureau.csv",
+  bureau_balance = "bureau_balance.csv",
+  credit_card_balance = "credit_card_balance.csv",
+  installments_payments = "installments_payments.csv",
+  POS_CASH_balance = "POS_CASH_balance.csv",
+  previous_application = "previous_application.csv",
+  sample_submission = "sample_submission.csv"
+)
+
+missing_files <- files[!file.exists(files)]
+if (length(missing_files)) {
+  stop("Missing required files: ", paste(missing_files, collapse = ", "))
+}
+
+file_inventory <- tibble(
+  table = names(files),
+  file = unname(files),
+  size_mb = round(file.info(files)$size / 1024^2, 1)
+)
+print(file_inventory)
+
+# Read one supplemental table at a time. Several tables are large, so remove
+# objects after each section instead of retaining every raw table in memory.
+read_table <- function(file) read_csv(file, show_col_types = FALSE, progress = FALSE)
+
+# Return a compact structural and missingness audit for any table.
+audit_table <- function(data, table_name, key_columns) {
+  overview <- tibble(
+    table = table_name,
+    rows = nrow(data),
+    columns = ncol(data),
+    key_columns = paste(intersect(key_columns, names(data)), collapse = ", ")
+  )
+  missingness <- tibble(
+    column = names(data),
+    missing_pct = map_dbl(data, ~ mean(is.na(.x)) * 100),
+    distinct_values = map_int(data, ~ n_distinct(.x, na.rm = TRUE))
+  ) |>
+    arrange(desc(missing_pct))
+  list(overview = overview, missingness = missingness)
+}
+
+train_keys <- read_table(files[["application_train"]]) |> select(SK_ID_CURR, TARGET)
+test_keys <- read_table(files[["application_test"]]) |> select(SK_ID_CURR)
+```
+
+# Relationship map
+
+| Table | Native grain | Application key | Secondary key | Main timing field |
+|---|---|---|---|---|
+| `bureau` | One bureau credit record | `SK_ID_CURR` | `SK_ID_BUREAU` | `DAYS_CREDIT` |
+| `bureau_balance` | One bureau-credit month | Indirect via bureau | `SK_ID_BUREAU` | `MONTHS_BALANCE` |
+| `previous_application` | One prior application | `SK_ID_CURR` | `SK_ID_PREV` | `DAYS_DECISION` |
+| `POS_CASH_balance` | One prior-loan month | `SK_ID_CURR` | `SK_ID_PREV` | `MONTHS_BALANCE` |
+| `credit_card_balance` | One prior-card month | `SK_ID_CURR` | `SK_ID_PREV` | `MONTHS_BALANCE` |
+| `installments_payments` | One scheduled installment/payment | `SK_ID_CURR` | `SK_ID_PREV` | `DAYS_INSTALMENT`, `DAYS_ENTRY_PAYMENT` |
+| `sample_submission` | One test application | `SK_ID_CURR` | — | — |
+
+All timing fields are relative to the current application. A value of zero or a
+positive value must be reviewed before use because it may be concurrent with or
+after the current application and could cause leakage.
+
+# Question 1: Are keys complete and are child tables linked to valid applications?
+
+```{r}
+#| label: key-coverage
+#| echo: true
+supplemental_specs <- tribble(
+  ~table, ~file, ~key, ~parent_key,
+  "bureau", files[["bureau"]], "SK_ID_CURR", NA_character_,
+  "bureau_balance", files[["bureau_balance"]], "SK_ID_BUREAU", "bureau.csv",
+  "credit_card_balance", files[["credit_card_balance"]], "SK_ID_CURR", NA_character_,
+  "installments_payments", files[["installments_payments"]], "SK_ID_CURR", NA_character_,
+  "POS_CASH_balance", files[["POS_CASH_balance"]], "SK_ID_CURR", NA_character_,
+  "previous_application", files[["previous_application"]], "SK_ID_CURR", NA_character_
+)
+
+key_audit <- pmap_dfr(supplemental_specs, function(table, file, key, parent_key) {
+  data <- read_table(file)
+  result <- tibble(
+    table = table,
+    rows = nrow(data),
+    null_key = sum(is.na(data[[key]])),
+    distinct_key = n_distinct(data[[key]], na.rm = TRUE),
+    duplicate_key_rows = sum(duplicated(data[[key]]))
+  )
+  rm(data); gc(FALSE)
+  result
+})
+print(key_audit)
+```
+
+Duplicate values are expected for monthly and payment-level tables. The audit
+identifies their grain; it does not imply that duplicates are data errors.
+
+# Question 2: What are the coverage, missingness, and timing characteristics of each table?
+
+## Bureau credit records
+
+```{r}
+#| label: bureau-eda
+bureau <- read_table(files[["bureau"]])
+bureau_audit <- audit_table(bureau, "bureau", c("SK_ID_CURR", "SK_ID_BUREAU"))
+print(bureau_audit$overview)
+print(slice_head(bureau_audit$missingness, n = 12))
+
+bureau_summary <- bureau |>
+  mutate(
+    current_application_coverage = SK_ID_CURR %in% train_keys$SK_ID_CURR,
+    debt_to_credit = if_else(AMT_CREDIT_SUM > 0, AMT_CREDIT_SUM_DEBT / AMT_CREDIT_SUM, NA_real_),
+    nonprior_record = DAYS_CREDIT >= 0
+  ) |>
+  summarise(
+    applications = n_distinct(SK_ID_CURR),
+    bureau_records = n(),
+    records_per_application = bureau_records / applications,
+    nonprior_record_pct = mean(nonprior_record, na.rm = TRUE) * 100,
+    debt_to_credit_missing_pct = mean(is.na(debt_to_credit)) * 100
+  )
+print(bureau_summary)
+# Summarize the most common combinations before plotting the active/closed mix.
+print(bureau |> count(CREDIT_ACTIVE, CREDIT_TYPE, sort = TRUE) |> slice_head(n = 20))
+bureau |> count(CREDIT_ACTIVE) |>
+  ggplot(aes(x = reorder(CREDIT_ACTIVE, n), y = n, fill = CREDIT_ACTIVE)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Bureau credit records by account status",
+    x = "Bureau account status", y = "Number of bureau records"
+  )
+rm(bureau); gc(FALSE)
+```
+
+Interpretation: The summary establishes bureau coverage and whether active,
+closed, or sold accounts dominate the available history. A nonzero percentage
+of non-prior records requires an explicit leakage rule before bureau features
+are aggregated to the current application.
+
+## Bureau monthly status
+
+```{r}
+#| label: bureau-balance-eda
+bureau_balance <- read_table(files[["bureau_balance"]])
+bureau_balance_audit <- audit_table(bureau_balance, "bureau_balance", "SK_ID_BUREAU")
+print(bureau_balance_audit$overview)
+print(slice_head(bureau_balance_audit$missingness, n = 10))
+# Status is categorical; show both the table and a labeled frequency plot.
+status_counts <- bureau_balance |> count(STATUS, sort = TRUE)
+print(status_counts)
+status_counts |>
+  ggplot(aes(x = reorder(STATUS, n), y = n, fill = STATUS)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Monthly bureau status distribution",
+    x = "Monthly bureau status code", y = "Number of monthly records"
+  )
+print(bureau_balance |> summarise(
+  records = n(),
+  bureau_accounts = n_distinct(SK_ID_BUREAU),
+  earliest_month = min(MONTHS_BALANCE, na.rm = TRUE),
+  latest_month = max(MONTHS_BALANCE, na.rm = TRUE)
+))
+rm(bureau_balance); gc(FALSE)
+```
+
+Interpretation: The status table and plot show whether the monthly history is
+mostly closed/unknown/current or contains material delinquency status codes.
+The earliest and latest months define the observable history window.
+
+## Previous applications
+
+```{r}
+#| label: previous-application-eda
+previous <- read_table(files[["previous_application"]])
+previous_audit <- audit_table(previous, "previous_application", c("SK_ID_CURR", "SK_ID_PREV"))
+print(previous_audit$overview)
+print(slice_head(previous_audit$missingness, n = 15))
+
+previous_summary <- previous |>
+  mutate(
+    application_to_credit = if_else(AMT_CREDIT > 0, AMT_APPLICATION / AMT_CREDIT, NA_real_),
+    nonprior_record = DAYS_DECISION >= 0
+  ) |>
+  summarise(
+    applications = n_distinct(SK_ID_CURR), prior_applications = n(),
+    applications_per_customer = prior_applications / applications,
+    nonprior_record_pct = mean(nonprior_record, na.rm = TRUE) * 100
+  )
+print(previous_summary)
+# Plot prior-application outcomes to assess the available decision history.
+previous_status <- previous |> count(NAME_CONTRACT_STATUS, sort = TRUE)
+print(previous |> count(NAME_CONTRACT_STATUS, NAME_CONTRACT_TYPE, sort = TRUE))
+previous_status |>
+  ggplot(aes(x = reorder(NAME_CONTRACT_STATUS, n), y = n, fill = NAME_CONTRACT_STATUS)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Prior applications by contract status",
+    x = "Prior-application status", y = "Number of prior applications"
+  )
+rm(previous); gc(FALSE)
+```
+
+Interpretation: Prior approvals, refusals, and cancellations can be meaningful
+history features only when their decision dates precede the current application.
+The non-prior percentage flags records that need exclusion or source review.
+
+## Installment payments
+
+```{r}
+#| label: installments-eda
+installments <- read_table(files[["installments_payments"]])
+installment_audit <- audit_table(installments, "installments_payments", c("SK_ID_CURR", "SK_ID_PREV"))
+print(installment_audit$overview)
+print(slice_head(installment_audit$missingness, n = 10))
+
+installment_summary <- installments |>
+  mutate(
+    days_late = DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT,
+    payment_ratio = if_else(AMT_INSTALMENT > 0, AMT_PAYMENT / AMT_INSTALMENT, NA_real_),
+    nonprior_record = DAYS_INSTALMENT >= 0 | DAYS_ENTRY_PAYMENT >= 0
+  ) |>
+  summarise(
+    applications = n_distinct(SK_ID_CURR), payment_rows = n(),
+    late_payment_pct = mean(days_late > 0, na.rm = TRUE) * 100,
+    nonprior_record_pct = mean(nonprior_record, na.rm = TRUE) * 100,
+    median_payment_ratio = median(payment_ratio, na.rm = TRUE)
+  )
+print(installment_summary)
+# Use a reproducible sample only for the plot; all summary statistics above use
+# the complete table. This prevents a multi-million-row graphic from obscuring
+# the distribution.
+set.seed(6812)
+timing_plot_data <- installments |>
+  transmute(days_late = DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT) |>
+  filter(is.finite(days_late), days_late >= -100, days_late <= 100)
+
+timing_plot_data |>
+  slice_sample(n = min(100000, nrow(timing_plot_data))) |>
+  ggplot(aes(x = days_late)) +
+  geom_histogram(binwidth = 2, fill = "#4C78A8", color = "white") +
+  labs(
+    title = "Distribution of installment payment timing",
+    x = "Days late (positive values are late)", y = "Number of payment records"
+  )
+rm(installments); gc(FALSE)
+```
+
+Interpretation: The payment-timing plot reveals whether payments cluster on or
+before due dates or have a long late-payment tail. The late-payment percentage
+and payment ratio are candidate aggregates, not current-application outcomes.
+
+## POS cash and credit-card monthly balances
+
+```{r}
+#| label: monthly-balance-eda
+monthly_specs <- tribble(
+  ~table, ~file,
+  "POS_CASH_balance", files[["POS_CASH_balance"]],
+  "credit_card_balance", files[["credit_card_balance"]]
+)
+
+pwalk(monthly_specs, function(table, file) {
+  data <- read_table(file)
+  audit <- audit_table(data, table, c("SK_ID_CURR", "SK_ID_PREV"))
+  cat("\n", table, "\n", sep = "")
+  print(audit$overview)
+  print(slice_head(audit$missingness, n = 10))
+  print(data |> summarise(
+    applications = n_distinct(SK_ID_CURR), rows = n(),
+    earliest_month = min(MONTHS_BALANCE, na.rm = TRUE),
+    latest_month = max(MONTHS_BALANCE, na.rm = TRUE),
+    any_positive_dpd_pct = mean(SK_DPD > 0, na.rm = TRUE) * 100
+  ))
+  # Plot contract-status frequencies with table-specific titles and axis labels.
+  status_counts <- data |> count(NAME_CONTRACT_STATUS, sort = TRUE) |> slice_head(n = 15)
+  print(status_counts)
+  status_counts |>
+    ggplot(aes(x = reorder(NAME_CONTRACT_STATUS, n), y = n, fill = NAME_CONTRACT_STATUS)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    scale_y_continuous(labels = comma) +
+    labs(
+      title = paste("Contract status in", table),
+      x = "Contract status", y = "Number of monthly records"
+    ) |>
+    print()
+  rm(data); gc(FALSE)
+})
+```
+
+Interpretation: These tables show the coverage, recency, delinquency presence,
+and contract-status composition of monthly cash and card histories. A positive
+delinquency percentage supports creating pre-application delinquency-count or
+recency aggregates after timing is confirmed.
+
+# Question 3: Does `sample_submission` match the test-application population?
+
+```{r}
+#| label: submission-audit
+submission <- read_table(files[["sample_submission"]])
+submission_audit <- tibble(
+  test_rows = nrow(test_keys),
+  submission_rows = nrow(submission),
+  duplicate_submission_ids = sum(duplicated(submission$SK_ID_CURR)),
+  test_ids_missing_from_submission = sum(!test_keys$SK_ID_CURR %in% submission$SK_ID_CURR),
+  submission_ids_not_in_test = sum(!submission$SK_ID_CURR %in% test_keys$SK_ID_CURR)
+)
+print(submission_audit)
+
+submission_audit |>
+  pivot_longer(everything(), names_to = "check", values_to = "count") |>
+  ggplot(aes(x = reorder(check, count), y = count, fill = check)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Sample-submission and test-ID reconciliation",
+    x = "Reconciliation check", y = "Count"
+  )
+rm(submission); gc(FALSE)
+```
+
+Interpretation: The two mismatch counts should be zero and submission rows
+should equal test rows. If they do not, predictions cannot be submitted safely
+until the identifier discrepancy is resolved.
+
+# Feature-engineering readiness
+
+The EDA identifies candidate aggregates, but they must be calculated from
+records known before the current application. Candidate families include:
+
+- Bureau: count of prior records, active-record count, debt/credit summaries,
+  credit-type diversity, and overdue amounts.
+- Bureau balance: recent status, delinquency-status counts, and history length,
+  joined through `SK_ID_BUREAU`.
+- Previous applications: prior-application count, approval/rejection counts,
+  prior loan amounts, and decision recency.
+- Installments: payment count, lateness, underpayment, and payment-ratio
+  summaries.
+- POS cash and credit card: delinquency frequency, balance/limit utilization,
+  contract-status counts, and recency.
+
+Before implementation, remove or explicitly justify any rows with nonnegative
+relative dates, confirm that every child-table key maps to its parent, fit any
+imputation or binning on training data only, and aggregate to one row per
+`SK_ID_CURR` before joining to application data.

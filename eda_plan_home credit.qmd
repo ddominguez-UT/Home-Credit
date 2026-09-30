@@ -1,0 +1,902 @@
+---
+title: "Home Credit Exploratory Data Analysis"
+author: "Diana Dominguez"
+date: last-modified
+engine: knitr
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: false
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+execute-dir: file
+execute:
+  echo: true
+  output: true
+  warning: false
+  error: false
+  cache: false
+editor: source
+---
+
+*This notebook performs exploratory data analysis against application train and test datasets. Results are descriptive. The documented outcome is payment difficulty.* 
+
+# Business Problem Statement
+
+Home Credit provides consumer financing to underserved customers, including those with limited or no traditional credit history. Its challenge is to identify repayment risk accurately enough to reduce avoidable credit losses without excluding applicants who are capable of repayment. A data-driven approach can support responsible, informed lending decisions.
+
+# Standing checks
+
+The six standing checks are shown first as a compact audit.
+
+```{r}
+#| label: eda-r-001
+#| echo: false
+#| output: false
+library(tidyverse)
+library(scales)
+
+getwd()
+list.files()
+
+
+options(dplyr.summarise.inform = FALSE)
+theme_set(theme_minimal(base_size = 11))
+
+# Positron should be opened to the folder containing these files.
+project_dir <- getwd()
+
+train_path <- file.path(project_dir, "application_train.csv")
+test_path <- file.path(project_dir, "application_test.csv")
+dict_path <- file.path(
+  project_dir,
+  "HomeCredit_columns_description.csv"
+)
+
+# Confirm that R can locate each file before loading it.
+required_files <- c(
+  application_train = train_path,
+  application_test = test_path,
+  data_dictionary = dict_path
+)
+
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    "The following files were not found in the current project folder:\n",
+    paste(basename(missing_files), collapse = "\n"),
+    "\n\nCurrent folder: ",
+    project_dir,
+    "\n\nOpen the folder containing the CSV files as your Positron project."
+  )
+}
+
+cat("Project folder:", project_dir, "\n")
+cat("Training file found:", file.exists(train_path), "\n")
+cat("Test file found:", file.exists(test_path), "\n")
+cat("Dictionary found:", file.exists(dict_path), "\n\n")
+
+# Load the datasets.
+train <- readr::read_csv(
+  train_path,
+  show_col_types = FALSE
+)
+
+test <- readr::read_csv(
+  test_path,
+  show_col_types = FALSE
+)
+
+dictionary <- readr::read_csv(
+  dict_path,
+  locale = locale(encoding = "Latin1"),
+  show_col_types = FALSE
+)
+
+# Helper functions used by later EDA sections.
+rate_table <- function(data, group, min_n = 1) {
+  data |>
+    group_by(.data[[group]], .drop = FALSE) |>
+    summarise(
+      n = n(),
+      payment_difficulty_rate = mean(TARGET, na.rm = TRUE)
+    ) |>
+    filter(n >= min_n) |>
+    arrange(desc(payment_difficulty_rate))
+}
+
+quantile_band <- function(x, groups = 10) {
+  breaks <- unique(
+    quantile(
+      x,
+      probs = seq(0, 1, length.out = groups + 1),
+      na.rm = TRUE
+    )
+  )
+
+  cut(
+    x,
+    breaks = breaks,
+    include.lowest = TRUE,
+    ordered_result = TRUE
+  )
+}
+
+cramers_v <- function(x, y) {
+  tab <- table(addNA(x), y, useNA = "ifany")
+
+  if (min(dim(tab)) < 2) {
+    return(NA_real_)
+  }
+
+  test <- suppressWarnings(
+    chisq.test(tab, correct = FALSE)
+  )
+
+  sqrt(
+    as.numeric(test$statistic) /
+      sum(tab) /
+      max(1, min(dim(tab) - 1))
+  )
+}
+
+cat(
+  glue::glue(
+    "Loaded application_train: ",
+    "{comma(nrow(train))} rows x {ncol(train)} columns\n"
+  )
+)
+
+cat(
+  glue::glue(
+    "Loaded application_test: ",
+    "{comma(nrow(test))} rows x {ncol(test)} columns\n"
+  )
+)
+```
+
+## Check 1: Target distribution
+
+```{r}
+#| label: eda-r-002
+#| echo: true
+#| output: true
+# Count applications in each target class and convert counts to percentages.
+target_check <- train |>
+  count(TARGET, name = "count") |>
+  mutate(percent = count / nrow(train) * 100)
+print(target_check)
+```
+
+The output shows the count and percentage of training applications in each documented target class. The distribution is imbalanced, with a majority of applicants not experiencing payment difficulty. Only 8.07% belong to the payment-difficulty class, compared with 91.93% in the other class. This indicates substantial class imbalance, with approximately 11.39 applications in the majority class for every one application in the minority class.
+
+## Check 2: Missingness and relationship to the target
+
+```{r}
+#| label: eda-r-003
+#| echo: true
+#| output: true
+# Compare payment-difficulty rates for missing versus observed values in every field.
+missing_check <- map_dfr(setdiff(names(train), "TARGET"), function(column) {
+  missing <- is.na(train[[column]])
+  if (!any(missing)) return(NULL)
+  tibble(
+    column = column,
+    missing_pct = mean(missing) * 100,
+    missing_n = sum(missing),
+    target_rate_missing = mean(train$TARGET[missing], na.rm = TRUE),
+    target_rate_observed = mean(train$TARGET[!missing], na.rm = TRUE)
+  )
+}) |>
+  arrange(desc(missing_pct))
+print(slice_head(missing_check, n = 15))
+```
+
+The output shows the 15 training fields with the most null values and the target rate for missing and observed records.
+The most incomplete fields are property-related variables, with approximately 66%–70% of their values missing. For every field shown, applicants with missing values have a higher payment-difficulty rate (approximately 8.6%) than applicants with observed values (approximately 6.9%). This indicates that missingness may be informative and should not automatically be treated as random. Missing-value indicators may therefore be useful during modeling.
+
+## Check 3: Impossible and undocumented values
+
+```{r}
+#| label: eda-r-004
+#| echo: true
+#| output: true
+# Count known sentinel, undocumented, and out-of-domain values in each table.
+known_checks <- tribble(
+  ~table, ~column, ~value, ~row_count,
+  "application_train", "DAYS_EMPLOYED", "365243", sum(train$DAYS_EMPLOYED == 365243, na.rm = TRUE),
+  "application_test", "DAYS_EMPLOYED", "365243", sum(test$DAYS_EMPLOYED == 365243, na.rm = TRUE),
+  "application_train", "CODE_GENDER", "XNA", sum(train$CODE_GENDER == "XNA", na.rm = TRUE),
+  "application_train", "NAME_FAMILY_STATUS", "Unknown", sum(train$NAME_FAMILY_STATUS == "Unknown", na.rm = TRUE),
+  "application_test", "REGION_RATING_CLIENT_W_CITY", "-1", sum(test$REGION_RATING_CLIENT_W_CITY == -1, na.rm = TRUE)
+)
+print(known_checks)
+```
+
+The output shows counts for the sentinel and out-of-domain values documented in the data map. Days employed is a sentinel value rather than a valid employment duration and should not be treated as an ordinary numeric value. Its similar frequency in the training and test datasets suggests that this coding convention is consistent across both datasets. The undocumented gender and family-status values are rare, but they should be treated as distinct categories rather than missing values. The undocumented region rating is a negative value that is outside the documented range of 1–3. 
+
+## Check 4: Keys, duplicates, and grain
+
+```{r}
+#| label: eda-r-005
+#| echo: true
+#| output: true
+# Verify that the application identifier is complete and unique within each table.
+key_check <- tibble(
+  table = c("application_train", "application_test"),
+  rows = c(nrow(train), nrow(test)),
+  distinct_keys = c(n_distinct(train$SK_ID_CURR, na.rm = FALSE), n_distinct(test$SK_ID_CURR, na.rm = FALSE)),
+  null_keys = c(sum(is.na(train$SK_ID_CURR)), sum(is.na(test$SK_ID_CURR))),
+  duplicate_keys = c(sum(duplicated(train$SK_ID_CURR)), sum(duplicated(test$SK_ID_CURR)))
+)
+# Check whether any application identifier occurs in both train and test.
+overlap <- length(intersect(train$SK_ID_CURR, test$SK_ID_CURR))
+print(key_check)
+cat(glue::glue("Train/test SK_ID_CURR overlap: {comma(overlap)}\n"))
+```
+
+The output shows row and key counts, null and duplicate keys, and the overlap between train and test identifiers. The current loan application identifiers are unique in both application datasets, with no overlap, which indicates that there is no overlap between the two sets. Therefore, the primary key structure is valid and there is no identifier-level train/test leakage.
+
+## Check 5: Temporal direction
+
+```{r}
+#| label: eda-r-006
+#| echo: true
+#| output: true
+# Record the proposed timing/use classification for key groups of fields.
+temporal_check <- tribble(
+  ~classification, ~columns,
+  "Identifier", "SK_ID_CURR",
+  "Outcome / exclude", "TARGET",
+  "Application-time by dictionary", "All remaining application fields except external scores",
+  "Ambiguous provenance or timing", "EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3"
+)
+print(temporal_check)
+```
+
+The output shows the timing classification used to separate identifiers, the outcome, documented application fields, and fields with ambiguous provenance. The identifier is SK_ID_CURR, the outcome is TARGET, and all other documented application fields are considered to be known at application time. The three external-score fields are ambiguous because their timing is not documented. They may have been generated before or after the loan application was submitted. 
+
+## Check 6: Train/test consistency
+
+```{r}
+#| label: eda-r-007
+#| echo: true
+#| output: true
+# Separate the training outcome from the predictor schema used for comparison.
+train_predictors <- setdiff(names(train), "TARGET")
+test_columns <- names(test)
+categorical_columns <- intersect(names(select(train, where(is.character))), names(select(test, where(is.character))))
+
+# Identify categorical levels that occur in only one dataset.
+level_mismatches <- map_dfr(categorical_columns, function(column) {
+  train_levels <- sort(unique(na.omit(train[[column]])))
+  test_levels <- sort(unique(na.omit(test[[column]])))
+  if (setequal(train_levels, test_levels)) return(NULL)
+  tibble(
+    column = column,
+    train_only_levels = paste(setdiff(train_levels, test_levels), collapse = ", "),
+    test_only_levels = paste(setdiff(test_levels, train_levels), collapse = ", ")
+  )
+})
+
+# Count data-type differences among columns shared by train and test.
+type_mismatches <- sum(map_lgl(intersect(train_predictors, test_columns), ~ class(train[[.x]])[1] != class(test[[.x]])[1]))
+cat("Predictor columns only in train:", paste(setdiff(train_predictors, test_columns), collapse = ", "), "\n")
+cat("Predictor columns only in test:", paste(setdiff(test_columns, train_predictors), collapse = ", "), "\n")
+cat("Data-type mismatches:", type_mismatches, "\n")
+print(level_mismatches)
+```
+
+The output shows schema differences, data-type mismatches, and categorical levels found in only one population. The training and test datasets have the same predictor columns and compatible data types, so the same preprocessing pipeline can be applied to both. Three categorical values occur only in training, but each is extremely rare. No categorical levels occur only in testing. The rare training-only values should be grouped into an "Other" or "Unknown" category.
+
+# Exploratory Analyses
+
+## Question 1: What is the grain of each table and are its keys complete and unique?
+
+```{r}
+#| label: eda-r-008
+#| echo: true
+#| output: true
+# Convert the key audit into an explicit statement of table grain and key validity.
+grain_audit <- key_check |>
+  mutate(
+    grain = "one current loan application per SK_ID_CURR",
+    key_complete_unique = null_keys == 0 & duplicate_keys == 0
+  ) |>
+  select(table, grain, rows, distinct_keys, null_keys, duplicate_keys, key_complete_unique)
+print(grain_audit)
+```
+
+The output shows one application row per unique, nonmissing `SK_ID_CURR` in each table. No null or duplicate application keys were found.
+
+## Question 2: What proportion of training applications experienced payment difficulty (`TARGET = 1`), and how imbalanced is the target?
+
+```{r}
+#| label: eda-r-009
+#| echo: true
+#| output: true
+# Reuse the target counts to quantify class imbalance.
+target_summary <- target_check
+minority <- min(target_summary$count)
+majority <- max(target_summary$count)
+print(target_summary)
+cat(glue::glue("Majority-to-minority count ratio: {round(majority / minority, 2)}:1\n"))
+
+# Plot the percentage of applications in each target class.
+ggplot(target_summary, aes(x = factor(TARGET), y = percent, fill = factor(TARGET))) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.2f%%", percent)), vjust = -0.3) +
+  scale_fill_manual(values = c("#4C78A8", "#E45756")) +
+  labs(title = "Training target distribution", x = "TARGET", y = "Percent of training applications")
+```
+
+The output shows the training target counts, percentages, and majority-to-minority class ratio. The training target is imbalanced, with a majority of applicants (91.9 %) not experiencing payment difficulty. The bar chart shows the percentage of training applications in each target class. There are approximately 11.39 applications without payment difficulty (TARGET = 0) for every 1 application with payment difficulty (TARGET = 1). 
+
+## Question 3: Which variables would have been known at application time, and which could introduce target leakage or use post-application information?
+
+```{r}
+#| label: eda-r-010
+#| echo: true
+#| output: true
+# Assign each field a preliminary timing classification and proposed modeling use.
+inventory <- tibble(column = names(train)) |>
+  mutate(
+    classification = case_when(
+      column == "SK_ID_CURR" ~ "Identifier",
+      column == "TARGET" ~ "Outcome / exclude from predictors",
+      str_starts(column, "EXT_SOURCE_") ~ "Ambiguous provenance or timing",
+      TRUE ~ "Likely application-time based on table context"
+    ),
+    proposed_use = case_when(
+      classification == "Identifier" ~ "record linkage only",
+      classification == "Outcome / exclude from predictors" ~ "outcome only",
+      classification == "Application-time by dictionary" ~ "candidate predictor after quality review",
+      TRUE ~ "hold pending source confirmation"
+    )
+  )
+print(count(inventory, classification, proposed_use, name = "column_count"))
+cat("\nColumns requiring source confirmation:\n")
+print(filter(inventory, str_starts(classification, "Ambiguous")))
+```
+
+The output shows the number of fields in each temporal-use class and lists the external-score fields requiring source confirmation. Based on their descriptions and application-table context, 117 of the 122 fields are classified as candidate predictors, subject to data-quality and timing review.
+
+## Question 4: How does payment difficulty vary across income levels and reported income types?
+
+```{r}
+#| label: eda-r-014
+#| echo: true
+#| output: true
+# Divide reported income into ten empirical bands.
+income_analysis <- train |>
+  mutate(income_band = quantile_band(AMT_INCOME_TOTAL, 10))
+income_by_band <- income_analysis |>
+  group_by(income_band) |>
+  summarise(n = n(), payment_difficulty_rate = mean(TARGET))
+income_type <- rate_table(train, "NAME_INCOME_TYPE", min_n = 30)
+print(income_by_band)
+print(income_type)
+
+# Plot payment-difficulty rates across ordered income bands.
+ggplot(income_by_band, aes(income_band, payment_difficulty_rate, group = 1)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Income band", y = "Payment-difficulty rate") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The output shows application counts and payment-difficulty rates across income bands and reported income types. As income increases, the payment-difficulty rate generally decreases. The line chart shows a downward trend in payment-difficulty rates across income bands. Applicants reporting "Pensioner" or "State servant" income types have lower payment-difficulty rates than those reporting "Working" or "Commercial associate" income types.
+
+## Question 5: How does payment difficulty vary with employment tenure, occupation, and employer organization type?
+
+```{r}
+#| label: eda-r-015
+#| echo: true
+#| output: true
+# Convert valid negative day counts to years and retain the positive sentinel separately.
+employment <- train |>
+  mutate(
+    employment_years = if_else(DAYS_EMPLOYED <= 0, -DAYS_EMPLOYED / 365.25, NA_real_),
+    tenure_band = cut(employment_years, c(-Inf, 1, 3, 5, 10, 20, Inf), labels = c("<=1", "1-3", "3-5", "5-10", "10-20", ">20")),
+    tenure_band = fct_explicit_na(tenure_band, na_level = "sentinel_365243")
+  )
+# Compare target rates across tenure, occupation, and organization groups.
+cat("Employment tenure:\n")
+print(rate_table(employment, "tenure_band", 30))
+cat("\nOccupation types (n >= 500):\n")
+print(slice_head(rate_table(train, "OCCUPATION_TYPE", 500), n = 25))
+cat("\nOrganization types (n >= 500):\n")
+print(slice_head(rate_table(train, "ORGANIZATION_TYPE", 500), n = 25))
+```
+
+The output shows payment-difficulty rates by valid employment-tenure bands, the employment sentinel group, occupation, and organization type. Employment characteristics appear to contain useful predictive information. Shorter tenure and several labor-intensive occupations and industries are associated with higher payment-difficulty rates. However, these associations may reflect differences in income, age, job stability, loan characteristics, or other factors. Occupation and organization type may also act as socioeconomic proxies, so their use should be evaluated for fairness and governance concerns.
+
+## Question 6: How does the proposed loan-payment burden relate to payment difficulty?
+
+```{r}
+#| label: eda-r-016
+#| echo: true
+#| output: true
+# Use proposed annuity divided by reported income as a relative payment-burden proxy.
+payment_burden <- train$AMT_ANNUITY / na_if(train$AMT_INCOME_TOTAL, 0)
+# Summarize payment difficulty across ten burden bands.
+burden_analysis <- train |>
+  mutate(payment_burden = payment_burden, burden_band = quantile_band(payment_burden, 10))
+burden_summary <- burden_analysis |>
+  group_by(burden_band) |>
+  summarise(n = n(), payment_difficulty_rate = mean(TARGET))
+print(summary(payment_burden))
+print(burden_summary)
+
+# Plot the potentially nonlinear relationship between burden and the target rate.
+ggplot(burden_summary, aes(burden_band, payment_difficulty_rate, group = 1)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Annuity-to-income band", y = "Payment-difficulty rate") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The output shows the distribution of proposed annuity-to-income burden and payment-difficulty rates across its bands. Applicants with larger proposed annuity payments relative to reported income generally have higher payment-difficulty rates. The rate rises from approximately 7.1% in the lowest burden band to approximately 8.9% in the upper-middle bands. However, the rate falls slightly in the highest band, indicating that the relationship is not strictly linear. The annuity-to-income ratio may therefore be a useful predictor.
+
+## Question 7: How do requested credit amount, annuity, goods price, and contract type relate to payment difficulty?
+
+```{r}
+#| label: eda-r-017
+#| echo: true
+#| output: true
+# Summarize the three principal monetary fields.
+loan_columns <- c("AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE")
+print(summary(select(train, all_of(loan_columns))))
+# Calculate target rates within ten bands for each monetary field.
+walk(loan_columns, function(column) {
+  result <- train |>
+    mutate(band = quantile_band(.data[[column]], 10)) |>
+    group_by(band) |>
+    summarise(n = n(), payment_difficulty_rate = mean(TARGET))
+  cat("\n", column, " target rates:\n", sep = "")
+  print(result)
+})
+# Compare payment difficulty across contract types.
+cat("\nContract type:\n")
+print(rate_table(train, "NAME_CONTRACT_TYPE"))
+```
+
+The output shows robust summaries and banded payment-difficulty rates for the three loan amounts and for each contract type. Payment difficulty varies across credit, annuity, and goods-price bands, but none has a simple increasing relationship with risk. Middle-value bands often have higher difficulty rates than either the lowest or highest bands. Cash loans also have a higher payment-difficulty rate than revolving loans. These findings suggest that loan amounts and contract type contain predictive information, but their effects should be considered together with applicant income, loan term, and affordability ratios.
+
+## Question 8: Do combinations of income, credit amount, and annuity distinguish applicants with greater payment difficulty more clearly than the raw amounts alone?
+
+```{r}
+#| label: eda-r-018
+#| echo: true
+#| output: true
+# Engineer affordability and loan-structure ratios from the raw monetary fields.
+engineered <- train |>
+  transmute(
+    credit_to_income = AMT_CREDIT / na_if(AMT_INCOME_TOTAL, 0),
+    annuity_to_income = AMT_ANNUITY / na_if(AMT_INCOME_TOTAL, 0),
+    annuity_to_credit = AMT_ANNUITY / na_if(AMT_CREDIT, 0),
+    credit_to_goods = AMT_CREDIT / na_if(AMT_GOODS_PRICE, 0)
+  )
+
+# Measure each raw field's absolute point-biserial correlation with the target.
+raw_features <- c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY")
+raw_comparison <- map_dfr(raw_features, ~ tibble(
+  feature = .x, feature_type = "raw",
+  absolute_point_biserial_correlation = abs(cor(train[[.x]], train$TARGET, use = "complete.obs"))
+))
+# Apply the same univariate measure to the engineered ratios.
+engineered_comparison <- map_dfr(names(engineered), ~ tibble(
+  feature = .x, feature_type = "engineered",
+  absolute_point_biserial_correlation = abs(cor(engineered[[.x]], train$TARGET, use = "complete.obs"))
+))
+comparison <- bind_rows(raw_comparison, engineered_comparison) |>
+  arrange(desc(absolute_point_biserial_correlation))
+print(comparison)
+```
+
+The output shows the absolute univariate target correlation for the raw amounts and four documented affordability combinations. Credit_to_goods has the strongest univariate relationship with payment difficulty, although its absolute correlation of 0.069 is still weak. It performs better than any raw monetary variable, suggesting that the relationship between requested credit and goods price contains more information than either amount alone. However, the other engineered ratios do not consistently outperform the raw features. Therefore, combining monetary variables does not universally produce stronger predictors.
+
+## Question 9: How does payment difficulty vary by housing situation, real-estate ownership, car ownership, and available residential-property characteristics?
+
+```{r}
+#| label: eda-r-019
+#| echo: true
+#| output: true
+# Compare target rates across housing and ownership categories.
+walk(c("NAME_HOUSING_TYPE", "FLAG_OWN_REALTY", "FLAG_OWN_CAR"), function(column) {
+  cat("\n", column, ":\n", sep = "")
+  print(rate_table(train, column))
+})
+
+# Identify residential-property fields by their naming conventions.
+property_columns <- names(train)[
+  str_detect(names(train), "(_AVG|_MODE|_MEDI)$") |
+    names(train) %in% c("TOTALAREA_MODE", "FONDKAPREMONT_MODE", "HOUSETYPE_MODE", "WALLSMATERIAL_MODE", "EMERGENCYSTATE_MODE")
+]
+# Report completeness and cardinality for the least-missing property fields.
+property_summary <- tibble(
+  column = property_columns,
+  missing_pct = map_dbl(property_columns, ~ mean(is.na(train[[.x]])) * 100),
+  nunique = map_int(property_columns, ~ n_distinct(train[[.x]], na.rm = TRUE))
+) |>
+  arrange(missing_pct)
+print(slice_head(property_summary, n = 15))
+```
+
+The output shows payment-difficulty rates for housing and ownership categories and completeness for the least-missing residential-property fields. Housing situation and car ownership show meaningful differences in payment-difficulty rates, while real-estate ownership shows a smaller difference. Residential-property characteristics may provide additional information, but their high missingness substantially limits their coverage. Any use of these variables should include explicit missing-value treatment and possibly missingness indicators. 
+
+## Question 10: How do the three external-source scores relate individually and jointly to payment difficulty? 
+
+```{r}
+#| label: eda-r-020
+#| echo: true
+#| output: true
+# Calculate pairwise-complete correlations among external scores and the target.
+external_scores <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+correlation <- cor(select(train, all_of(c(external_scores, "TARGET"))), use = "pairwise.complete.obs")
+print(correlation)
+
+# Show how the target rate changes across ten bands of each external score.
+walk(external_scores, function(column) {
+  result <- train |>
+    mutate(band = quantile_band(.data[[column]], 10)) |>
+    group_by(band) |>
+    summarise(n = n(), payment_difficulty_rate = mean(TARGET))
+  cat("\n", column, ":\n", sep = "")
+  print(result)
+})
+
+# Test whether the number of available external scores is itself informative.
+joint <- train |>
+  mutate(ext_available = rowSums(!is.na(pick(all_of(external_scores))))) |>
+  group_by(ext_available) |>
+  summarise(n = n(), payment_difficulty_rate = mean(TARGET))
+print(joint)
+
+# Visualize the score and target correlation matrix.
+as.data.frame(correlation) |>
+  rownames_to_column("row") |>
+  pivot_longer(-row, names_to = "column", values_to = "correlation") |>
+  ggplot(aes(column, row, fill = correlation)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", correlation))) +
+  scale_fill_gradient2(low = "#4575B4", mid = "white", high = "#D73027", midpoint = 0) +
+  labs(title = "External-score and target correlations", x = NULL, y = NULL)
+```
+
+The output shows correlations, score-band target rates, and target rates by the number of external scores available. Higher external-source scores are consistently associated with substantially lower payment-difficulty rates, and EXT_SOURCE_3 has the strongest individual relationship with the target. The relatively weak correlations among the scores suggest that they may contribute complementary predictive information. Score availability is also associated with the outcome: applicants with all three scores have a lower difficulty rate than applicants with only one score. Missingness indicators may therefore be useful alongside the score values.
+
+## Question 11: Which numeric and categorical applicant or application characteristics have the strongest individual associations with payment difficulty (TARGET)?
+```{r}
+#| label: eda-r-021
+#| echo: true
+#| output: true
+
+association_data <- train |>
+  mutate(
+    # Recode the employment sentinel before correlation analysis.
+    DAYS_EMPLOYED = na_if(DAYS_EMPLOYED, 365243)
+  )
+
+# Exclude identifiers, outcome, and fields awaiting timing confirmation.
+excluded_columns <- c(
+  "SK_ID_CURR",
+  "TARGET",
+  "EXT_SOURCE_1",
+  "EXT_SOURCE_2",
+  "EXT_SOURCE_3"
+)
+
+numeric_columns <- association_data |>
+  select(where(is.numeric)) |>
+  names() |>
+  setdiff(excluded_columns)
+
+# Calculate complete-case Pearson and Spearman correlations for each numeric field.
+numeric_associations <- map_dfr(numeric_columns, function(column) {
+  complete <- complete.cases(
+    association_data[[column]],
+    association_data$TARGET
+  )
+
+  x <- association_data[[column]][complete]
+  y <- association_data$TARGET[complete]
+
+  valid <- length(x) >= 30 && n_distinct(x) > 1
+
+  tibble(
+    column = column,
+    complete_n = length(x),
+    pearson_correlation = if (valid) cor(x, y) else NA_real_,
+    spearman_correlation = if (valid) cor(x, y, method = "spearman") else NA_real_
+  )
+}) |>
+  mutate(
+    absolute_pearson = abs(pearson_correlation),
+    absolute_spearman = abs(spearman_correlation)
+  ) |>
+  arrange(desc(absolute_spearman))
+
+print(slice_head(numeric_associations, n = 20))
+```
+
+The strongest numeric associations, after excluding external scores, are employment tenure and age. Shorter employment tenure and younger age are associated with more payment difficulty. Higher regional-risk ratings, more recent phone changes, and older owned vehicles are also associated with higher difficulty rates. Larger residential-property characteristics generally show negative associations with payment difficulty. However, all absolute correlations are below 0.10, indicating that these variables are individually weak predictors and may be more useful when combined or modeled nonlinearly.
+
+## Question 12: How does recent credit-bureau inquiry activity relate to payment difficulty?
+```{r}
+#| label: eda-r-022
+#| echo: true
+#| output: true
+# Select every bureau-inquiry field, regardless of its lookback window.
+inquiry_columns <- names(train)[str_starts(names(train), "AMT_REQ_CREDIT_BUREAU_")]
+# Place inquiry counts into common bands and calculate the target rate in each band.
+inquiry_summary <- map_dfr(inquiry_columns, function(column) {
+  train |>
+    mutate(inquiry_band = cut(.data[[column]], c(-Inf, 0, 1, 2, 5, Inf), labels = c("0", "1", "2", "3-5", ">5"))) |>
+    group_by(inquiry_band) |>
+    summarise(n = n(), payment_difficulty_rate = mean(TARGET)) |>
+    mutate(window = str_remove(column, "AMT_REQ_CREDIT_BUREAU_"), .before = 1)
+})
+print(inquiry_summary)
+```
+
+Inquiry activity during the previous year shows the clearest pattern. Payment difficulty increases from 7.14% for applicants with no yearly inquiries to 9.18% for applicants with more than five. This suggests that frequent yearly credit inquiries may indicate greater financial pressure or active credit seeking. Results for hourly, daily, weekly, and quarterly windows are less consistent because most applicants have no inquiries and the higher-count groups contain very few records. Monthly inquiries show an opposite pattern, so inquiry frequency does not have a consistent relationship with payment difficulty across all time windows.
+
+## Question 13: Which applicant and loan characteristics show the strongest descriptive association with payment difficulty?
+```{r}
+#| label: eda-r-023
+#| echo: true
+#| output: true
+# Use absolute correlation for numeric fields and Cramer's V for categorical fields.
+association_rows <- map_dfr(setdiff(names(train), c("TARGET", "SK_ID_CURR")), function(column) {
+  x <- train[[column]]
+  if (is.numeric(x) && n_distinct(x, na.rm = TRUE) > 1) {
+    strength <- abs(cor(x, train$TARGET, use = "complete.obs"))
+    type <- "numeric"
+  } else {
+    strength <- cramers_v(x, train$TARGET)
+    type <- "categorical"
+  }
+  tibble(feature = column, type = type, association_strength = strength, missing_pct = mean(is.na(x)) * 100)
+})
+# Rank finite univariate associations from strongest to weakest.
+associations <- association_rows |>
+  filter(is.finite(association_strength)) |>
+  arrange(desc(association_strength))
+print(slice_head(associations, n = 30))
+```
+
+The output ranks the 30 largest univariate descriptive associations with the target and reports each field's missing percentage. External-source scores have the strongest associations with payment difficulty, followed by occupation, age, organization type, income type, regional rating, and education. Most associations are weak, indicating that no single characteristic is a strong predictor. Several highly ranked fields also have substantial missingness, which should be addressed before modeling.
+
+Expanded summary: The external-source scores have the strongest individual associations with payment difficulty. EXT_SOURCE_3 ranks highest (0.179), followed by EXT_SOURCE_2 (0.160) and EXT_SOURCE_1 (0.155). Higher external scores are associated with lower payment-difficulty rates. However, EXT_SOURCE_1 is 56.4% missing and EXT_SOURCE_3 is 19.8% missing, which must be considered before using them. Among the remaining characteristics, occupation type (0.080), applicant age (0.078), employer organization type (0.072), income type (0.064), regional rating (approximately 0.06), and education type (0.058) have the strongest associations. Several residential-property fields also appear in the ranking, but many are approximately 47%–51% missing.
+
+Overall, association strengths outside the external scores are below 0.10. This indicates that no individual applicant or loan characteristic has a strong standalone relationship with payment difficulty. Predictive performance will likely depend on combining multiple variables and capturing nonlinear relationships and interactions.
+
+## Question 14: Are important risk patterns consistent across contract type, income type, employment category, and housing category?
+
+```{r}
+#| label: eda-r-024
+#| echo: true
+#| output: true
+# Select the three leading numeric associations, excluding age itself.
+top_numeric <- associations |>
+  filter(type == "numeric", feature != "DAYS_BIRTH") |>
+  slice_head(n = 3) |>
+  pull(feature)
+segment_columns <- c("NAME_CONTRACT_TYPE", "NAME_INCOME_TYPE", "OCCUPATION_TYPE", "NAME_HOUSING_TYPE")
+
+# Cross each leading feature with each applicant segment and retain cells of adequate size.
+segment_consistency <- crossing(feature = top_numeric, segment = segment_columns) |>
+  pmap_dfr(function(feature, segment) {
+    grouped <- train |>
+      mutate(feature_band = quantile_band(.data[[feature]], 5)) |>
+      group_by(.data[[segment]], feature_band) |>
+      summarise(n = n(), payment_difficulty_rate = mean(TARGET)) |>
+      filter(n >= 200)
+    tibble(
+      feature = feature, segment = segment, eligible_cells = nrow(grouped),
+      min_cell_rate = if (nrow(grouped)) min(grouped$payment_difficulty_rate) else NA_real_,
+      max_cell_rate = if (nrow(grouped)) max(grouped$payment_difficulty_rate) else NA_real_
+    )
+  })
+print(segment_consistency)
+```
+
+The output shows the number and target-rate range of adequately sized within-segment cells for the leading numeric associations. Payment-difficulty rates vary substantially across the segment-and-score groups. The widest ranges occur across occupations: approximately 1.9%–27.2% for EXT_SOURCE_3, 2.4%–23.5% for EXT_SOURCE_2, and 2.0%–21.4% for EXT_SOURCE_1. Contract type produces narrower ranges, while income type and housing type fall between these extremes. This indicates that risk levels differ across applicant segments even when external-score bands are considered. Therefore, segmenting applicants by contract type, income type, occupation, and housing type may improve risk differentiation. 
+
+## Question 15: Which combinations of applicant capacity and requested loan burden identify relatively higher- and lower-risk groups?
+
+```{r}
+#| label: eda-r-025
+#| echo: true
+#| output: true
+# Cross five income bands with five annuity-to-income burden bands.
+combination_grid <- train |>
+  mutate(
+    income_band = quantile_band(AMT_INCOME_TOTAL, 5),
+    burden_band = quantile_band(payment_burden, 5)
+  ) |>
+  group_by(income_band, burden_band) |>
+  summarise(n = n(), payment_difficulty_rate = mean(TARGET)) |>
+  filter(n >= 200)
+print(arrange(combination_grid, desc(payment_difficulty_rate)))
+
+# Display the joint target rates as a heatmap.
+ggplot(combination_grid, aes(burden_band, income_band, fill = payment_difficulty_rate)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", payment_difficulty_rate))) +
+  scale_fill_gradient(low = "white", high = "#D73027", labels = percent) +
+  labs(title = "Payment-difficulty rate by income and annuity-to-income bands", x = "Burden band", y = "Income band")
+```
+
+The output shows application counts and payment-difficulty rates for adequately sized combinations of income and proposed payment-burden bands. The highest payment-difficulty rate, 10.55%, occurs among applicants earning approximately 135,000–162,000 with an annuity-to-income ratio of about 18.6%–24.7%. Applicants earning 99,000–135,000 in the same burden band also have an elevated rate of 9.43%. Lower-income applicants in the highest burden band have a rate of 9.19%.
+
+The lowest rate, 3.90%, occurs among applicants in the highest income band with the highest measured burden, followed by 5.21% for high-income applicants in the 18.6%–24.7% burden band. This indicates that the relationship between payment burden and difficulty depends on income and is not strictly increasing.
+
+## Question 16: Are potentially useful risk indicators also concentrated among demographic groups protected or restricted under fair-lending rules?
+
+```{r}
+#| label: eda-r-026
+#| echo: true
+#| output: true
+# Derive age groups and define demographic fields used only for monitoring.
+monitor <- train |>
+  mutate(AGE_BAND = cut(-DAYS_BIRTH / 365.25, c(0, 25, 35, 45, 55, 65, Inf), right = FALSE))
+demographics <- c("CODE_GENDER", "AGE_BAND", "NAME_FAMILY_STATUS", "CNT_CHILDREN")
+# Select the ten indicators with the largest univariate target associations.
+candidate_indicators <- associations |> slice_head(n = 10) |> pull(feature)
+
+# Measure how each candidate indicator varies across each monitored demographic field.
+fairness_monitor <- crossing(monitoring_field = demographics, candidate_indicator = candidate_indicators) |>
+  pmap_dfr(function(monitoring_field, candidate_indicator) {
+    x <- monitor[[candidate_indicator]]
+    group <- monitor[[monitoring_field]]
+    if (is.numeric(x)) {
+      medians <- tapply(x, group, median, na.rm = TRUE)
+      value <- max(medians, na.rm = TRUE) - min(medians, na.rm = TRUE)
+      measure <- "numeric_median_spread"
+    } else {
+      value <- cramers_v(group, x)
+      measure <- "categorical_cramers_v"
+    }
+    tibble(
+      monitoring_field, candidate_indicator, measure, value,
+      minimum_group_n = min(table(group, useNA = "ifany"))
+    )
+  }) |>
+  arrange(desc(value))
+print(slice_head(fairness_monitor, n = 30))
+```
+
+The output shows the largest measured concentrations of leading candidate indicators across the selected demographic monitoring fields. Several leading indicators are concentrated differently across demographic groups. Occupation differs substantially by gender (Cramér’s V = 0.359), while organization type and income type vary notably across age bands (0.345 and 0.334). Occupation also varies across age groups (0.244). These relationships indicate that some potentially predictive variables could act as demographic proxies and should receive additional fairness monitoring.
+
+## Question 17: Are apparent demographic differences still present when comparing applicants with broadly similar income, employment, housing, and loan characteristics?
+
+```{r}
+#| label: eda-r-027
+#| echo: true
+#| output: true
+# Prepare transformed predictors and explicit factor levels for an explanatory model.
+model_data <- train |>
+  transmute(
+    TARGET,
+    CODE_GENDER = factor(CODE_GENDER),
+    AGE_YEARS = -DAYS_BIRTH / 365.25,
+    NAME_FAMILY_STATUS = factor(NAME_FAMILY_STATUS),
+    CNT_CHILDREN,
+    LOG_INCOME = log1p(AMT_INCOME_TOTAL),
+    NAME_INCOME_TYPE = factor(NAME_INCOME_TYPE),
+    EMPLOYMENT_YEARS = if_else(DAYS_EMPLOYED <= 0, -DAYS_EMPLOYED / 365.25, NA_real_),
+    OCCUPATION_TYPE = fct_explicit_na(factor(OCCUPATION_TYPE), "Missing"),
+    NAME_HOUSING_TYPE = factor(NAME_HOUSING_TYPE),
+    FLAG_OWN_REALTY = factor(FLAG_OWN_REALTY),
+    LOG_CREDIT = log1p(AMT_CREDIT),
+    LOG_ANNUITY = log1p(AMT_ANNUITY),
+    LOG_GOODS_PRICE = log1p(AMT_GOODS_PRICE),
+    NAME_CONTRACT_TYPE = factor(NAME_CONTRACT_TYPE)
+  ) |>
+  # Median-impute remaining numeric missing values for this descriptive model.
+  mutate(across(where(is.numeric), ~ replace_na(.x, median(.x, na.rm = TRUE))))
+
+# Fit an adjusted logistic regression; this is explanatory, not a validated risk model.
+adjusted_model <- glm(
+  TARGET ~ CODE_GENDER + AGE_YEARS + NAME_FAMILY_STATUS + CNT_CHILDREN +
+    LOG_INCOME + NAME_INCOME_TYPE + EMPLOYMENT_YEARS + OCCUPATION_TYPE +
+    NAME_HOUSING_TYPE + FLAG_OWN_REALTY + LOG_CREDIT + LOG_ANNUITY +
+    LOG_GOODS_PRICE + NAME_CONTRACT_TYPE,
+  data = model_data,
+  family = binomial()
+)
+
+# Retain only demographic terms for fairness-oriented review.
+demographic_terms <- broom::tidy(adjusted_model) |>
+  filter(str_detect(term, "CODE_GENDER|AGE_YEARS|NAME_FAMILY_STATUS|CNT_CHILDREN")) |>
+  select(term, estimate, std.error, statistic, p.value)
+print(demographic_terms)
+```
+
+The output shows coefficients for the demographic monitoring terms in an explanatory logistic model that also includes the listed income, employment, housing, and loan fields. Gender and age remain associated with payment difficulty after accounting for the included applicant and loan characteristics. Male applicants have approximately 28% higher estimated odds of payment difficulty than female applicants. Each additional year of age is associated with approximately 1.7% lower odds. Married applicants have about 18% lower estimated odds than applicants in the civil-marriage reference group.
+
+The coefficients indicate that, after adjusting for the other factors, gender, age, family status, and number of children still have statistically significant associations with payment difficulty. This suggests that these demographic variables may capture information not fully explained by the other applicant and loan characteristics, highlighting the need for careful consideration in their use for underwriting decisions. 
+
+## Question 18: Which available variables should be reserved for fairness monitoring rather than used as ordinary underwriting predictors?
+
+```{r}
+#| label: eda-r-028
+#| echo: true
+#| output: true
+# Document proposed handling for sensitive, proxy-prone, and opaque fields.
+governance <- tribble(
+  ~field, ~proposed_disposition, ~reason_for_review,
+  "CODE_GENDER", "fairness monitoring only", "sex/gender field; restricted use",
+  "NAME_FAMILY_STATUS", "fairness monitoring only", "marital-status field; restricted use",
+  "CNT_CHILDREN", "fairness monitoring only pending legal review", "childrearing-related proxy risk",
+  "DAYS_BIRTH", "fairness monitoring / constrained use", "age use is legally constrained",
+  "OCCUPATION_TYPE", "candidate predictor subject to review", "profession may create proxy and adverse-action concerns",
+  "ORGANIZATION_TYPE", "candidate predictor subject to review", "employer type may create proxy and explainability concerns",
+  "REGION_POPULATION_RELATIVE", "candidate predictor subject to review", "geographic proxy risk",
+  "REGION_RATING_CLIENT", "candidate predictor subject to review", "geographic proxy risk",
+  "REGION_RATING_CLIENT_W_CITY", "candidate predictor subject to review", "geographic proxy risk and one out-of-domain test value",
+  "EXT_SOURCE_1/2/3", "hold pending documentation", "source, timing, inputs, and score semantics are not documented"
+)
+print(governance)
+```
+
+The output shows the proposed governance disposition and review reason for sensitive, proxy-prone, and undocumented fields. Gender and family status are reserved for fairness monitoring rather than ordinary prediction. Number of children and age also require restricted or legally reviewed use. Occupation, employer organization, and regional variables may contain predictive information, but they require additional review because they could act as demographic or geographic proxies and create explainability concerns. The three external-source scores should be withheld until their source, inputs, timing, meaning, and permitted use are documented.
+
+# Final Review of EDA Coverage
+
+The following items remain outside, or only partly addressed by, the approved EDA questions after comparison with the business problem statement, data dictionary, six standing checks, and underwriting plausibility requirements:
+
+1. **Outcome definition is incomplete.** The dictionary does not disclose the values of *X* and *Y* in the `TARGET` definition, so the precise delinquency threshold and observation window remain unknown.
+2. **Thin-file status cannot be identified.** The supplied tables contain no bureau tradeline count, age of credit history, credit mix, utilization, or documented thin-file flag.
+3. **Full debt-to-income cannot be built.** Existing debt obligations and recurring debt payments are absent; annuity-to-income covers only the proposed loan payment.
+4. **Cash-flow repayment capacity is absent.** There are no bank transactions, recurring expenses, residual balances, overdrafts, rent, utility, or telecom payment histories.
+5. **Loan pricing and duration are absent.** Interest rate, APR, term, fees, and contractual maturity are unavailable, so payment burden cannot be decomposed into price and duration.
+6. **Selection and approval bias cannot be measured.** The data does not include a clearly documented rejected-applicant population or historical decision policy.
+7. **Business success metrics cannot be completed.** Approval rate, delinquency timing/severity, realized default loss, recoveries, and credit-loss reduction are not available from these two tables.
+8. **Currency, market, and observation date are undocumented.** Monetary amounts cannot be compared to external affordability benchmarks or inflation-adjusted without these definitions.
+9. **External scores are opaque.** Their provider, training population, input data, observation time, scale meaning, and permissible-use status are not supplied.
+10. **Document flags are opaque.** `FLAG_DOCUMENT_2` through `FLAG_DOCUMENT_21` do not identify the underlying documents, limiting underwriting interpretation.
+11. **Sentinel and missing-value governance is required.** `DAYS_EMPLOYED = 365243`, `CODE_GENDER = XNA`, `NAME_FAMILY_STATUS = Unknown`, and the test rating of `-1` require explicit handling rules.
+12. **Model performance and calibration are not part of this EDA.** Risk ranking, probability calibration, out-of-sample performance, threshold trade-offs, and stability monitoring require later modeling and validation.
+13. **Fairness findings remain descriptive.** Available demographic comparisons cannot establish unlawful discrimination, causal effects, or compliant feature use without legal review and fuller process data.
+14. **Plausibility requires source reconciliation.** An underwriter would require documented units, lineage, verification status, definitions, and observation timing before relying on applicant-reported or externally scored fields.
+
+```{r}
+#| label: eda-r-029
+#| echo: true
+#| output: true
+# Record whether each required underwriting or validation input is available.
+completeness_audit <- tribble(
+  ~required_item, ~available_in_supplied_tables,
+  "TARGET threshold/window X and Y", "False",
+  "thin-file identifier", "False",
+  "existing debt obligations", "False",
+  "cash-flow time series", "False",
+  "loan APR and term", "False",
+  "approval/rejection decision", "False",
+  "loss and recovery amounts", "False",
+  "currency and observation date", "False",
+  "external-score provenance", "False",
+  "application outcome for training", "TARGET in train only"
+)
+print(completeness_audit)
+```
+
+The output shows which underwriting and business-validation inputs remain unavailable in the supplied application tables. The supplied data supports descriptive analysis and prediction of the documented payment-difficulty target, but it does not support a complete underwriting or business-impact assessment. The absence of existing debts, cash-flow history, loan pricing and term, rejected applications, loss and recovery amounts, currency information, and external-score provenance limits affordability analysis, profitability evaluation, selection-bias assessment, and interpretation of external scores. Any resulting model should therefore be presented as an application-level payment-difficulty model rather than a complete credit-risk or lending-decision system
+
+# Results 
+
+Performing stage-wise EDA has revealed several important insights and considerations for the analytics approach:
+
+1. **Data Quality and Completeness**: The analysis highlighted significant missingness in key variables, particularly the external-source scores and residential-property characteristics. This missingness must be addressed through imputation or the use of missingness indicators to avoid bias in predictive modeling. Additionally, the supplemental datasets will help fully assess payment difficulty and affordability.
+2. **Predictive Relationships**: Several variables showed meaningful associations with payment difficulty, including external-source scores, occupation type, age, organization type, income type, and regional ratings. However, most of these associations were weak (absolute correlations below 0.10), indicating that no single variable is a strong predictor on its own. This suggests that a multivariate modeling approach, potentially incorporating feature engineering, interactions and nonlinear relationships, will be necessary to capture the complexity of payment difficulty.
+3. **Fairness and Governance Concerns**: The analysis revealed that some predictive variables, such as occupation and organization type, may act as proxies for protected demographic characteristics. This raises concerns about fairness and potential bias in predictive modeling. 
+4. **Segmented Analysis**: The EDA demonstrated that payment difficulty varies across different segments, such as contract type, income type, occupation, and housing type. This suggests that segmenting applicants based on these characteristics may improve risk differentiation and model performance. It also indicates that the relationship between payment burden and difficulty is not strictly linear and may depend on income levels, highlighting a nuanced approach to modeling.
+5. **Modeling Approach**: Given the weak individual associations and the potential for interactions among variables, a machine learning approach that can capture complex relationships may be more appropriate than traditional linear models. Techniques such as decision trees or random forest may be considered to effectively model payment difficulty while accounting for the various factors identified in the EDA.
+
+In summary, the EDA has provided valuable insights into the data quality, predictive relationships, and potential modeling strategies. It has highlighted the need for careful handling of missing data, utilization of supplemental datasets, and the importance of a multivariate modeling approach to effectively predict payment difficulty.  
