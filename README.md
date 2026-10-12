@@ -6,7 +6,7 @@ The final prepared training and test datasets use consistent feature definitions
 Home credit default prediction project.
 This project analyzes the Home Credit dataset to identify factors associated with loan repayment and default risk.
 
-# Home Credit Data Preparation and Feature Engineering
+## Home Credit Data Preparation and Feature Engineering
 The data_preparation.R script creates a consistent, reusable workflow for preparing the Home Credit data for modeling. Rather than placing all preprocessing steps in a single notebook chunk, the script organizes them into functions that can be called on the training and test datasets using the same rules. This improves consistency, reduces repeated code, and helps prevent data leakage.
 The script is organized into five phases. Phase 1 cleans and transforms the application tables by addressing sentinel values, converting negative day fields into interpretable years, creating log-transformed monetary variables, and calculating basic loan-burden ratios. Phase 2 adds EDA-driven engineered features, including age and tenure bands, missing-data indicators, interaction variables, ownership combinations, and external-score summaries.
 Phase 3 processes the supplementary historical tables—bureau records, previous applications, payment installments, POS cash balances, and credit-card balances. It filters to records occurring before the current application and aggregates each table to one row per applicant. Phase 4 joins those applicant-level historical features to the application training and test tables using SK_ID_CURR. Phase 5 fits all data-dependent values, including imputation values and bin thresholds, using training data only. It then applies the same stored values to test data and confirms that both outputs contain matching predictor columns.
@@ -34,7 +34,7 @@ test_ready <- prepared$test
 
 ***The resulting train_ready dataset includes the final predictors and TARGET, while test_ready contains the same predictors without TARGET.***
 
-**Modeling Introduction**
+## Modeling Introduction
 This notebook develops and compares several models for predicting whether an applicant will experience payment difficulty (TARGET = 1). The modeling data combines the primary application tables with applicant-level features aggregated from the bureau, previous-application, installment, POS cash, and credit-card history tables. All models are evaluated using the same five stratified cross-validation folds, with ROC AUC serving as the primary selection metric.
 
 The analysis begins with a null model and then evaluates progressively more flexible algorithms. A pruned decision tree produced a mean cross-validated AUC of 0.6528, demonstrating that a small set of nonlinear decision rules provides some predictive discrimination but is insufficient for this complex outcome. A 100-tree random forest improved the AUC to 0.7504 by combining many nonlinear trees. Elastic-net logistic regression performed better, reaching 0.7629, showing that a regularized combination of application and historical predictors provides a strong benchmark.
