@@ -17,7 +17,11 @@ models/
 outputs/
 cache/
 tmp/
+.quarto-cache/
+Model Outputs/
 *.zip
+*.html
+*_files/
 
 # Local R / Positron files
 .Rhistory

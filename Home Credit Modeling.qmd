@@ -1,0 +1,586 @@
+---
+title: "Home Credit Default Risk: Modeling and Model Selection"
+subtitle: "Cross-validated comparison, tuning, and test probability generation"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+## Purpose and modeling strategy
+
+This notebook develops a reproducible model for predicting `TARGET`, where a
+value of 1 identifies an applicant with payment difficulty. The primary goal is
+to maximize out-of-sample ROC AUC while keeping the process understandable,
+computationally practical, and free from validation leakage.
+
+Every candidate uses the same five stratified folds. Feature encoders,
+imputation values, rare-category rules, and model parameters are learned from
+the analysis portion of a fold and then applied to its assessment portion. This
+means differences in model performance cannot be attributed to different data
+splits or to information leaking from assessment rows into preprocessing.
+
+::: {.callout-important title="Primary modeling rule"}
+All learned preprocessing must occur inside cross-validation. Fitting imputation
+or category rules on the complete training dataset before cross-validation would
+allow assessment-fold information to influence model development and could
+inflate the reported AUC.
+:::
+
+The notebook compares a null model, elastic-net logistic regression, a pruned
+decision tree, a random forest, and gradient-boosted trees. ROC AUC is the main
+selection measure. PR AUC is included because the event class is uncommon, and
+Brier score is included to assess probability error.
+
+## 1. Setup and reproducibility controls
+
+```{r}
+#| label: setup
+
+source("Scripts/data_preparation.R")
+source("Scripts/modeling_pipeline.R")
+
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(readr)
+
+check_modeling_packages()
+
+SEED <- 6812L
+CV_FOLDS <- 5L
+NTHREAD <- 4L
+
+# Supplemental credit-history features generally improve AUC. Their aggregated
+# application-level form is cached after the first run because the source files
+# exceed 2 GB in total.
+USE_SUPPLEMENTAL <- TRUE
+
+# Set FORCE_REFIT to TRUE only when data, features, folds, or tuning grids change.
+FORCE_REFIT <- FALSE
+OUTPUT_DIR <- "Model Outputs"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+cached_result <- function(path, expression, force_refit = FORCE_REFIT) {
+  if (file.exists(path) && !force_refit) return(readRDS(path))
+  value <- base::force(expression)
+  saveRDS(value, path)
+  value
+}
+
+package_versions <- data.frame(
+  package = required_modeling_packages(),
+  version = vapply(required_modeling_packages(), function(x) {
+    as.character(utils::packageVersion(x))
+  }, character(1))
+)
+kable(package_versions, caption = "Modeling package versions")
+```
+
+The seed, folds, and thread count are declared once. Intermediate results are
+cached so the document can be rendered repeatedly without refitting unchanged
+models. Four threads provide a practical balance between speed and leaving the
+computer responsive.
+
+::: {.callout-note title="Runtime and cached results"}
+The first complete run is intentionally the slowest because it builds historical
+aggregates and cross-validates every candidate. Later renders reuse files in
+`Model Outputs`. Set `FORCE_REFIT <- TRUE` only after changing the data, folds,
+features, or tuning grids.
+:::
+
+## 2. Load application and historical data
+
+```{r}
+#| label: load-data
+
+train_raw <- read_csv("application_train.csv", show_col_types = FALSE,
+                      progress = FALSE)
+test_raw <- read_csv("application_test.csv", show_col_types = FALSE,
+                     progress = FALSE)
+
+if (USE_SUPPLEMENTAL) {
+  enriched <- load_or_build_enriched_applications(
+    train_raw, test_raw,
+    cache_path = file.path(OUTPUT_DIR, "enriched_applications.rds")
+  )
+  train_source <- enriched$train
+  test_source <- enriched$test
+  feature_source <- "Application and supplemental history"
+} else {
+  train_source <- train_raw
+  test_source <- test_raw
+  feature_source <- "Application data only"
+}
+
+data_inventory <- data.frame(
+  data = c("Training", "Test"),
+  rows = c(nrow(train_source), nrow(test_source)),
+  columns = c(ncol(train_source), ncol(test_source)),
+  target_available = c("Yes", "No"),
+  feature_source = feature_source
+)
+kable(data_inventory, caption = "Modeling data inventory")
+```
+
+Historical tables contain multiple records per applicant. The preparation
+script filters them to pre-application information, aggregates each table to one
+row per `SK_ID_CURR`, and then joins those summaries without changing the
+application-table grain. The original test row order is preserved for the final
+submission.
+
+## 3. Engineer candidate predictors
+
+```{r}
+#| label: feature-engineering
+
+train_model <- make_modeling_frame(train_source)
+test_model <- make_modeling_frame(test_source)
+
+predictor_names <- setdiff(names(train_model), c("SK_ID_CURR", "TARGET"))
+stopifnot(identical(predictor_names,
+                    setdiff(names(test_model), "SK_ID_CURR")))
+
+feature_audit <- data.frame(
+  measure = c(
+    "Training rows", "Test rows", "Candidate predictors",
+    "Numeric predictors", "Categorical predictors",
+    "Predictors containing missing values"
+  ),
+  value = c(
+    nrow(train_model), nrow(test_model), length(predictor_names),
+    sum(vapply(train_model[predictor_names], is.numeric, logical(1))),
+    sum(!vapply(train_model[predictor_names], is.numeric, logical(1))),
+    sum(vapply(train_model[predictor_names], anyNA, logical(1)))
+  )
+)
+kable(feature_audit, caption = "Feature-engineering audit")
+```
+
+The engineered predictors retain the original application fields and add
+interpretable measures such as age, employment tenure, credit-to-income,
+annuity-to-income, external-score summaries, missingness flags, and aggregated
+credit-history behavior. `SK_ID_CURR` is retained only for row identification
+and is never supplied to a model.
+
+```{r}
+#| label: missingness-review
+
+missingness <- data.frame(
+  predictor = predictor_names,
+  missing_rate = vapply(train_model[predictor_names], function(x) {
+    mean(is.na(x) | (is.numeric(x) & !is.finite(x)))
+  }, numeric(1))
+) |>
+  arrange(desc(missing_rate)) |>
+  slice_head(n = 15)
+
+kable(missingness, digits = 3,
+      caption = "Predictors with the most missing information")
+```
+
+Missing values are not automatically treated as noise. The linear and tree
+benchmarks use analysis-fold medians plus explicit numeric missingness flags.
+XGBoost compares this approach with native missing-value routing, which learns
+the preferred branch for a missing value at each split.
+
+::: {.callout-tip title="Why native missing-value handling is tested"}
+Missingness was associated with `TARGET` during EDA. XGBoost's native routing
+can preserve that signal without inventing a median value, while the explicit
+comparison below determines whether it actually improves held-out AUC.
+:::
+
+## 4. Create and verify fixed cross-validation folds
+
+```{r}
+#| label: cross-validation-folds
+
+fold_path <- file.path(OUTPUT_DIR, "fixed_stratified_folds.rds")
+if (file.exists(fold_path) && !FORCE_REFIT) {
+  fold_id <- readRDS(fold_path)
+  if (length(fold_id) != nrow(train_model)) {
+    stop("Cached folds do not match the current training row count. Set FORCE_REFIT = TRUE.")
+  }
+} else {
+  fold_id <- make_stratified_folds(train_model$TARGET, CV_FOLDS, SEED)
+  saveRDS(fold_id, fold_path)
+}
+
+fold_audit <- fold_balance_table(train_model$TARGET, fold_id)
+kable(fold_audit, digits = 4,
+      caption = "Fixed stratified cross-validation folds")
+```
+
+Each row appears in one assessment fold and four analysis folds. Stratification
+keeps the event rate nearly identical across folds, making AUC comparisons more
+stable. These stored fold assignments are reused for every experiment below.
+
+## 5. Establish benchmark models
+
+### Null model
+
+```{r}
+#| label: null-model
+
+null_results <- cross_validate_null(train_model, fold_id)
+null_summary <- summarize_cv_results(null_results)
+kable(null_summary, digits = 4, caption = "Null-model cross-validation results")
+```
+
+The null model assigns the analysis-fold event rate to every assessment row. Its
+ROC AUC is 0.50 by construction. It is a probability-error reference rather
+than a useful ranking model.
+
+### Elastic-net logistic regression
+
+```{r}
+#| label: elastic-net
+
+glmnet_grid <- default_glmnet_grid()
+kable(glmnet_grid, caption = "Elastic-net tuning grid")
+
+glmnet_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_glmnet.rds"),
+  cross_validate_glmnet(train_model, fold_id, glmnet_grid)
+)
+glmnet_summary <- summarize_cv_results(glmnet_results)
+kable(slice_head(glmnet_summary, n = 6), digits = 4,
+      caption = "Leading elastic-net configurations")
+```
+
+Elastic-net logistic regression is the main interpretable benchmark. `alpha =
+1` applies lasso shrinkage, while `alpha = 0.5` combines lasso and ridge
+shrinkage. A pure ridge path was excluded after a full-data timing check showed
+that it was disproportionately slow for this notebook. Shrinkage remains
+important because dummy encoding and feature engineering create correlated
+predictors.
+
+### Pruned decision tree
+
+```{r}
+#| label: decision-tree
+
+tree_grid <- default_tree_grid()
+tree_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_decision_tree.rds"),
+  cross_validate_decision_tree(train_model, fold_id, tree_grid)
+)
+tree_summary <- summarize_cv_results(tree_results)
+kable(tree_summary, digits = 4,
+      caption = "Pruned decision-tree configurations")
+```
+
+The single tree is intentionally shallow and uses a compact set of EDA-relevant
+features. It provides an understandable nonlinear benchmark, though an ensemble
+is expected to rank applicants more accurately.
+
+### Random forest
+
+```{r}
+#| label: random-forest
+
+forest_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_xgboost_forest.rds"),
+  cross_validate_xgboost_forest(
+    train_model, fold_id, trees = 100L, max_depth = 8L, nthread = NTHREAD
+  )
+)
+forest_summary <- summarize_cv_results(forest_results)
+kable(forest_summary, digits = 4,
+      caption = "Random-forest cross-validation results")
+```
+
+The forest uses XGBoost's independent-tree mode. This retains random-forest
+behavior while fitting the full dataset much faster than the legacy R
+`randomForest` engine.
+
+## 6. Tune gradient-boosted trees and missing-value treatment
+
+```{r}
+#| label: xgboost-grid
+
+xgb_grid <- default_xgboost_grid()
+kable(xgb_grid, caption = "Initial XGBoost tuning grid")
+
+xgb_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_xgboost_initial.rds"),
+  cross_validate_xgboost(
+    train_model, fold_id, xgb_grid,
+    nthread = NTHREAD, early_stopping_rounds = 30L
+  )
+)
+xgb_summary <- summarize_cv_results(xgb_results)
+kable(xgb_summary, digits = 4,
+      caption = "XGBoost tuning and missing-data comparison")
+```
+
+The grid varies tree depth, learning rate, child-size regularization, and
+missing-data treatment. Early stopping ends a fold when additional trees stop
+improving its assessment AUC, limiting both overfitting and runtime. Comparing
+native missing routing with median imputation directly tests which treatment is
+more effective on this dataset.
+
+```{r}
+#| label: xgboost-refinement
+
+# If the leading configuration reaches its tree cap in every fold, extend only
+# that configuration. This is much cheaper than expanding the entire grid.
+best_initial_xgb <- slice_head(xgb_summary, n = 1)
+refinement_grid <- data.frame(
+  max_depth = best_initial_xgb$max_depth,
+  eta = best_initial_xgb$eta,
+  min_child_weight = best_initial_xgb$min_child_weight,
+  subsample = best_initial_xgb$subsample,
+  colsample_bytree = best_initial_xgb$colsample_bytree,
+  numeric_imputation = best_initial_xgb$numeric_imputation,
+  class_weight = "none",
+  nrounds = max(500L, as.integer(ceiling(best_initial_xgb$best_iteration_mean * 1.5)))
+)
+
+refinement_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_xgboost_refinement.rds"),
+  cross_validate_xgboost(
+    train_model, fold_id, refinement_grid,
+    nthread = NTHREAD, early_stopping_rounds = 30L
+  )
+)
+refinement_summary <- summarize_cv_results(refinement_results)
+kable(refinement_summary, digits = 4,
+      caption = "Focused XGBoost tree-count refinement")
+```
+
+The refinement extends only the best initial structure. It determines whether
+the original tree cap stopped a still-improving model without multiplying every
+other hyperparameter combination.
+
+## 7. Test class-imbalance strategies
+
+```{r}
+#| label: imbalance-experiments
+
+best_unweighted_xgb <- bind_rows(xgb_results, refinement_results) |>
+  summarize_cv_results() |>
+  slice_head(n = 1)
+imbalance_grid <- data.frame(
+  max_depth = best_unweighted_xgb$max_depth,
+  eta = best_unweighted_xgb$eta,
+  min_child_weight = best_unweighted_xgb$min_child_weight,
+  subsample = best_unweighted_xgb$subsample,
+  colsample_bytree = best_unweighted_xgb$colsample_bytree,
+  numeric_imputation = best_unweighted_xgb$numeric_imputation,
+  class_weight = c("sqrt", "balanced"),
+  # Keep the same tree budget as the unweighted winner so this experiment
+  # isolates the effect of class weighting.
+  nrounds = as.integer(round(best_unweighted_xgb$best_iteration_mean))
+)
+kable(imbalance_grid, caption = "Class-weight experiments")
+
+imbalance_results <- cached_result(
+  file.path(OUTPUT_DIR, "cv_xgboost_imbalance_refined.rds"),
+  cross_validate_xgboost(
+    train_model, fold_id, imbalance_grid,
+    nthread = NTHREAD, early_stopping_rounds = 30L
+  )
+)
+
+xgb_all_results <- bind_rows(xgb_results, refinement_results, imbalance_results)
+xgb_all_summary <- summarize_cv_results(xgb_all_results)
+kable(xgb_all_summary, digits = 4,
+      caption = "XGBoost results including class weighting")
+```
+
+Class weights change how strongly the model penalizes errors on `TARGET = 1`.
+The square-root strategy is moderate; the balanced strategy uses the full ratio
+of non-events to events. Weighting is retained only if it improves
+cross-validated ranking. Synthetic oversampling is not used because tree models
+already learn nonlinear boundaries, it adds substantial runtime, and it can
+distort probability calibration.
+
+## 8. Compare all candidate models
+
+```{r}
+#| label: model-comparison
+
+comparison <- bind_rows(
+  null_summary,
+  glmnet_summary,
+  tree_summary,
+  forest_summary,
+  xgb_all_summary
+) |>
+  select(model, config, roc_auc_mean, roc_auc_sd,
+         pr_auc_mean, pr_auc_sd, brier_mean, brier_sd, folds) |>
+  arrange(desc(roc_auc_mean))
+
+kable(comparison, digits = 4,
+      caption = "Cross-validated candidate-model comparison")
+
+ggplot(comparison, aes(x = reorder(paste(model, config, sep = ": "), roc_auc_mean),
+                       y = roc_auc_mean, color = model)) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = roc_auc_mean - roc_auc_sd,
+                    ymax = roc_auc_mean + roc_auc_sd), width = 0.15) +
+  coord_flip() +
+  labs(
+    title = "Cross-validated ROC AUC by model configuration",
+    x = NULL, y = "Mean ROC AUC (error bar = one fold SD)", color = "Model"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+The winning configuration is selected by mean fold ROC AUC. Fold standard
+deviation is shown so a very small apparent advantage can be interpreted in the
+context of resampling variability.
+
+## 9. Diagnose the selected model
+
+```{r}
+#| label: selected-model
+
+best_xgb <- slice_head(xgb_all_summary, n = 1)
+best_model_record <- best_xgb |>
+  mutate(
+    selected_on = Sys.Date(),
+    selection_metric = "Five-fold cross-validated ROC AUC",
+    external_test_auc = NA_real_,
+    external_test_status = "Pending competition submission"
+  )
+
+write_csv(best_model_record,
+          file.path(OUTPUT_DIR, "best_model_score_record.csv"))
+kable(best_model_record, digits = 4,
+      caption = "Selected model and recorded validation score")
+```
+
+The recorded score is an internal out-of-fold estimate. The supplied test file
+has no `TARGET`, so its AUC cannot be calculated locally. An external competition
+score should be entered in the record only after submitting the prediction file.
+
+::: {.callout-warning title="CV AUC is not the hidden test AUC"}
+The notebook can calculate cross-validated AUC because `TARGET` is available for
+training rows. The competition test outcomes are hidden, so the true test AUC
+can only be recorded after the generated submission is scored externally.
+:::
+
+```{r}
+#| label: calibration
+
+selected_grid <- data.frame(
+  max_depth = best_xgb$max_depth,
+  eta = best_xgb$eta,
+  min_child_weight = best_xgb$min_child_weight,
+  subsample = best_xgb$subsample,
+  colsample_bytree = best_xgb$colsample_bytree,
+  numeric_imputation = best_xgb$numeric_imputation,
+  class_weight = best_xgb$class_weight,
+  nrounds = max(100L, as.integer(round(best_xgb$best_iteration_mean)))
+)
+
+oof_predictions <- cached_result(
+  file.path(OUTPUT_DIR, "selected_xgboost_oof_predictions_refined.rds"),
+  cross_validated_xgboost_predictions(
+    train_model, fold_id, selected_grid, nthread = NTHREAD
+  )
+)
+
+selected_oof_metrics <- score_probabilities(
+  oof_predictions$truth, oof_predictions$probability
+)
+calibration <- calibration_table(
+  oof_predictions$truth, oof_predictions$probability
+)
+
+kable(selected_oof_metrics, digits = 4,
+      caption = "Selected model pooled out-of-fold metrics")
+kable(calibration, digits = 4,
+      caption = "Out-of-fold calibration by predicted-risk decile")
+
+ggplot(calibration, aes(x = predicted, y = observed)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(size = n), color = "#2C7FB8") +
+  geom_line(color = "#2C7FB8") +
+  coord_equal() +
+  labs(title = "Selected-model calibration",
+       x = "Mean predicted probability", y = "Observed TARGET rate",
+       size = "Applications") +
+  theme_minimal(base_size = 11)
+```
+
+Pooled out-of-fold predictions give each training application a probability from
+a model that did not train on that application. The calibration table compares
+mean predicted risk with the observed event rate across ten equally populated
+risk bands. This diagnostic complements AUC, which measures ordering but not the
+accuracy of probability levels.
+
+## 10. Refit and create test probabilities
+
+```{r}
+#| label: final-fit
+
+final_fit <- cached_result(
+  file.path(OUTPUT_DIR, "final_xgboost_fit.rds"),
+  fit_final_xgboost(
+    train_model, test_model, best_xgb,
+    final_nrounds = max(1L, as.integer(round(best_xgb$best_iteration_mean))),
+    nthread = NTHREAD
+  )
+)
+
+submission_path <- file.path(OUTPUT_DIR, "home_credit_submission.csv")
+write_csv(final_fit$submission, submission_path)
+
+submission_audit <- data.frame(
+  measure = c(
+    "Rows", "Unique applicant IDs", "Missing probabilities",
+    "Minimum probability", "Mean probability", "Maximum probability",
+    "Trees used in final fit"
+  ),
+  value = c(
+    nrow(final_fit$submission),
+    dplyr::n_distinct(final_fit$submission$SK_ID_CURR),
+    sum(is.na(final_fit$submission$TARGET)),
+    min(final_fit$submission$TARGET),
+    mean(final_fit$submission$TARGET),
+    max(final_fit$submission$TARGET),
+    final_fit$nrounds
+  )
+)
+kable(submission_audit, digits = 5,
+      caption = "Final test-prediction validation")
+
+head(final_fit$submission)
+```
+
+The selected workflow is refit on all labeled applications. Its number of trees
+is the mean best iteration from cross-validation, which transfers the stopping
+decision without using the unlabeled test data. The final file preserves every
+test applicant ID and contains a bounded `TARGET` probability with no missing
+values.
+
+## 11. Final conclusion
+
+```{r}
+#| label: conclusion-values
+
+cat(sprintf(
+  paste0(
+    "The selected model is %s (%s). Its mean five-fold ROC AUC is %.4f ",
+    "with a fold standard deviation of %.4f. The submission file is %s."
+  ),
+  best_xgb$model, best_xgb$config,
+  best_xgb$roc_auc_mean, best_xgb$roc_auc_sd,
+  submission_path
+))
+```
+
+The cross-validated AUC above is the final locally measurable score. The
+competition test AUC remains unknown until the submission file is evaluated
+against hidden outcomes. Once available, that external score should be added to
+`best_model_score_record.csv` without replacing the cross-validation result.
