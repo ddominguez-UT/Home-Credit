@@ -33,3 +33,15 @@ train_ready <- prepared$train
 test_ready <- prepared$test
 
 ***The resulting train_ready dataset includes the final predictors and TARGET, while test_ready contains the same predictors without TARGET.***
+
+**Modeling Introduction**
+This notebook develops and compares several models for predicting whether an applicant will experience payment difficulty (TARGET = 1). The modeling data combines the primary application tables with applicant-level features aggregated from the bureau, previous-application, installment, POS cash, and credit-card history tables. All models are evaluated using the same five stratified cross-validation folds, with ROC AUC serving as the primary selection metric.
+
+The analysis begins with a null model and then evaluates progressively more flexible algorithms. A pruned decision tree produced a mean cross-validated AUC of 0.6528, demonstrating that a small set of nonlinear decision rules provides some predictive discrimination but is insufficient for this complex outcome. A 100-tree random forest improved the AUC to 0.7504 by combining many nonlinear trees. Elastic-net logistic regression performed better, reaching 0.7629, showing that a regularized combination of application and historical predictors provides a strong benchmark.
+
+Gradient-boosted trees produced the best results. Several XGBoost configurations were evaluated by varying tree depth, learning rate, child-size regularization, missing-data treatment, class weighting, and number of boosting rounds. Native missing-value handling outperformed median imputation, suggesting that the pattern of missing information contains useful predictive signal. Class weighting did not improve AUC and substantially worsened probability error, so it was not used in the final model. Extending the leading model from 350 to 525 rounds also failed to improve validation performance.
+
+The selected model is an unweighted XGBoost model with a maximum tree depth of 7, learning rate of 0.05, minimum child weight of 20, native missing-value handling, and 350 boosting rounds. It achieved a mean five-fold ROC AUC of 0.7825, with a fold standard deviation of 0.0018. It was selected because it provided the strongest and most stable out-of-sample ranking performance while maintaining reasonable runtime. The selected workflow was subsequently refitted using all labeled training applications to generate payment-difficulty probabilities for the competition test set.
+
+
+
