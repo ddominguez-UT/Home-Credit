@@ -38,6 +38,26 @@ decision tree, a random forest, and gradient-boosted trees. ROC AUC is the main
 selection measure. PR AUC is included because the event class is uncommon, and
 Brier score is included to assess probability error.
 
+### Modeling overview and final result
+
+The modeling data combines the current application fields with applicant-level
+history aggregated from the bureau, previous-application, installment, POS cash,
+and credit-card tables. Model flexibility was increased gradually so that the
+performance benefit of nonlinear relationships and interactions could be judged
+against simpler benchmarks. The pruned decision tree achieved a mean
+cross-validated ROC AUC of 0.6528, the random forest achieved 0.7504, and the
+elastic-net logistic regression achieved 0.7629. XGBoost performed best at
+0.7825 (fold standard deviation 0.0018).
+
+The final XGBoost model uses depth 7, a learning rate of 0.05, minimum child
+weight of 20, native missing-value routing, no class weighting, and 350 boosting
+rounds. Native missing handling outperformed median imputation, class weighting
+reduced AUC and worsened probability error, and extending the model to 525
+rounds did not improve validation performance. The 350-round model was therefore
+selected as the strongest and more efficient configuration. Kaggle subsequently
+reported a public AUC of 0.78617 and a private AUC of 0.77982, supporting the
+cross-validation estimate and the model's generalization to hidden outcomes.
+
 ## 1. Setup and reproducibility controls
 
 ```{r}
@@ -56,6 +76,11 @@ check_modeling_packages()
 SEED <- 6812L
 CV_FOLDS <- 5L
 NTHREAD <- 4L
+
+# Scores returned by Kaggle for home_credit_submission.csv. The private score
+# is the final external evaluation; the public score is a preliminary subset.
+KAGGLE_PUBLIC_AUC <- 0.78617
+KAGGLE_PRIVATE_AUC <- 0.77982
 
 # Supplemental credit-history features generally improve AUC. Their aggregated
 # application-level form is cached after the first run because the source files
@@ -449,8 +474,10 @@ best_model_record <- best_xgb |>
   mutate(
     selected_on = Sys.Date(),
     selection_metric = "Five-fold cross-validated ROC AUC",
-    external_test_auc = NA_real_,
-    external_test_status = "Pending competition submission"
+    external_test_auc = KAGGLE_PRIVATE_AUC,
+    kaggle_public_auc = KAGGLE_PUBLIC_AUC,
+    kaggle_private_auc = KAGGLE_PRIVATE_AUC,
+    external_test_status = "Kaggle late submission scored successfully"
   )
 
 write_csv(best_model_record,
@@ -459,14 +486,17 @@ kable(best_model_record, digits = 4,
       caption = "Selected model and recorded validation score")
 ```
 
-The recorded score is an internal out-of-fold estimate. The supplied test file
-has no `TARGET`, so its AUC cannot be calculated locally. An external competition
-score should be entered in the record only after submitting the prediction file.
+The internal score records performance across the fixed cross-validation folds.
+Kaggle evaluated the submitted probabilities against hidden test outcomes and
+returned a public AUC of 0.78617 and a private AUC of 0.77982. The private score
+is treated as the final external result because it is calculated on the hidden
+private leaderboard subset.
 
-::: {.callout-warning title="CV AUC is not the hidden test AUC"}
-The notebook can calculate cross-validated AUC because `TARGET` is available for
-training rows. The competition test outcomes are hidden, so the true test AUC
-can only be recorded after the generated submission is scored externally.
+::: {.callout-note title="Internal and external AUC results"}
+The mean cross-validation AUC was 0.7825. Kaggle reported 0.78617 on the public
+subset and 0.77982 on the private subset. Their close agreement indicates that
+the fixed-fold validation design provided a credible estimate of performance on
+previously unseen applicants.
 :::
 
 ```{r}
@@ -572,15 +602,18 @@ values.
 cat(sprintf(
   paste0(
     "The selected model is %s (%s). Its mean five-fold ROC AUC is %.4f ",
-    "with a fold standard deviation of %.4f. The submission file is %s."
+    "with a fold standard deviation of %.4f. Kaggle public and private AUCs ",
+    "are %.5f and %.5f, respectively. The submission file is %s."
   ),
   best_xgb$model, best_xgb$config,
   best_xgb$roc_auc_mean, best_xgb$roc_auc_sd,
+  KAGGLE_PUBLIC_AUC, KAGGLE_PRIVATE_AUC,
   submission_path
 ))
 ```
 
-The cross-validated AUC above is the final locally measurable score. The
-competition test AUC remains unknown until the submission file is evaluated
-against hidden outcomes. Once available, that external score should be added to
-`best_model_score_record.csv` without replacing the cross-validation result.
+The private Kaggle AUC of 0.77982 is the final external score. It is 0.00266
+below the mean cross-validation AUC of 0.78248, a small difference consistent
+with ordinary sampling variation. The public AUC is slightly higher at 0.78617.
+Both external results are retained alongside—not substituted for—the
+cross-validation results used to select the model.
