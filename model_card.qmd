@@ -63,6 +63,23 @@ loss_given_default <- 1 - recovery_rate
 break_even_threshold <- good_loan_contribution /
   (good_loan_contribution + 100 * loss_given_default)
 
+# Alternative, user-proposed spread proxy from Home Credit application fields.
+# The data dictionary calls AMT_CREDIT the credit amount and AMT_GOODS_PRICE
+# the price of goods; it does not define their difference as realized revenue.
+credit_amount <- as.numeric(train_model[["AMT_CREDIT"]])
+goods_price <- as.numeric(train_model[["AMT_GOODS_PRICE"]])
+spread_valid <- is.finite(credit_amount) & is.finite(goods_price) &
+  credit_amount > 0 & goods_price > 0
+spread_per_goods_dollar <- rep(NA_real_, length(credit_amount))
+spread_per_goods_dollar[spread_valid] <-
+  (credit_amount[spread_valid] - goods_price[spread_valid]) / goods_price[spread_valid]
+spread_per_principal_dollar <- rep(NA_real_, length(credit_amount))
+spread_per_principal_dollar[spread_valid] <-
+  (credit_amount[spread_valid] - goods_price[spread_valid]) / credit_amount[spread_valid]
+mean_spread_per_principal <- mean(spread_per_principal_dollar[spread_valid])
+spread_break_even_threshold <- mean_spread_per_principal /
+  (mean_spread_per_principal + 1)
+
 threshold_metrics <- function(threshold, labels = truth, probs = probability) {
   predicted_default <- probs >= threshold
   actual_default <- labels == 1L
@@ -88,10 +105,66 @@ threshold_metrics <- function(threshold, labels = truth, probs = probability) {
   )
 }
 
+spread_threshold_metrics <- function(threshold) {
+  rows <- which(spread_valid)
+  labels <- truth[rows]
+  probs <- probability[rows]
+  principal <- credit_amount[rows]
+  goods <- goods_price[rows]
+  predicted_default <- probs >= threshold
+  approved <- !predicted_default
+  actual_default <- labels == 1L
+  tp <- sum(predicted_default & actual_default)
+  fp <- sum(predicted_default & !actual_default)
+  fn <- sum(!predicted_default & actual_default)
+  approved_default <- sum(approved & actual_default)
+  realized_dollars <- ifelse(actual_default, -principal, principal - goods)
+  approved_principal <- sum(principal[approved])
+  tibble(
+    threshold = threshold,
+    valid_applicants = length(rows),
+    approval_rate = mean(approved),
+    default_rate_approved = if (sum(approved)) mean(labels[approved] == 1L) else NA_real_,
+    precision_default = if (tp + fp) tp / (tp + fp) else NA_real_,
+    recall_default = if (tp + fn) tp / (tp + fn) else NA_real_,
+    net_value_per_100_all_principal = 100 * sum(ifelse(approved, realized_dollars, 0)) / sum(principal),
+    net_value_per_100_approved_principal = if (approved_principal > 0) {
+      100 * sum(realized_dollars[approved]) / approved_principal
+    } else NA_real_,
+    default_loans_approved = approved_default
+  )
+}
+
 chosen_metrics <- threshold_metrics(break_even_threshold)
 approve_all_value <- mean(ifelse(truth == 1L, -100 * loss_given_default,
                                  good_loan_contribution))
 incremental_value <- chosen_metrics$value_per_100_applicants - approve_all_value
+
+spread_chosen_metrics <- spread_threshold_metrics(spread_break_even_threshold)
+spread_approve_all <- spread_threshold_metrics(Inf)
+spread_incremental_value <- spread_chosen_metrics$net_value_per_100_all_principal -
+  spread_approve_all$net_value_per_100_all_principal
+spread_sensitivity_grid <- sort(unique(c(seq(0.02, 0.20, by = 0.02),
+                                         spread_break_even_threshold, Inf)))
+spread_sensitivity <- bind_rows(lapply(spread_sensitivity_grid,
+                                       spread_threshold_metrics)) |>
+  arrange(threshold)
+spread_summary <- tibble(
+  measure = c(
+    "Applications with valid positive credit and goods price",
+    "Share of training applicants covered",
+    "Mean proposed spread per $1 of goods price",
+    "Mean normalized spread per $1 of loan principal",
+    "Median normalized spread per $1 of loan principal"
+  ),
+  value = c(
+    sum(spread_valid),
+    mean(spread_valid),
+    mean(spread_per_goods_dollar[spread_valid]),
+    mean_spread_per_principal,
+    median(spread_per_principal_dollar[spread_valid])
+  )
+)
 
 auc_oof <- roc_auc_binary(truth, probability)
 decision_metrics <- chosen_metrics |>
@@ -155,6 +228,8 @@ adverse_mapping <- shap_summary |>
 The selected model is a five-fold cross-validated XGBoost classifier. Its pooled out-of-fold ROC AUC is **`r sprintf("%.4f", auc_oof)`**; the modeling notebook reports mean fold AUC **`r sprintf("%.4f", model_record$roc_auc_mean[1])`** (fold SD **`r sprintf("%.4f", model_record$roc_auc_sd[1])`**) and Kaggle public/private AUCs **`r sprintf("%.5f / %.5f", model_record$kaggle_public_auc[1], model_record$kaggle_private_auc[1])`**. At the illustrative cost-derived threshold of **`r sprintf("%.2f%%", 100 * break_even_threshold)`**, the out-of-fold approval rate is **`r sprintf("%.1f%%", 100 * chosen_metrics$approval_rate)`**, and the default rate among approved applicants is **`r sprintf("%.2f%%", 100 * chosen_metrics$default_rate_approved)`**.
 
 Under the stated assumptions, the observed out-of-fold portfolio value is **USD `r sprintf("%.2f per USD 100 of applicants", chosen_metrics$value_per_100_applicants)`** versus **USD `r sprintf("%.2f per USD 100 of applicants", approve_all_value)`** if every applicant were approved. The difference is **USD `r sprintf("%.2f per USD 100 of applicants", incremental_value)`**. These are historical backtest quantities using broad U.S. consumer-finance proxies, not forecasts for Home Credit. The data have no contractual pricing, term, funding costs, or loss severity for the scored loans.
+
+An alternative scenario uses the requested spread between `AMT_CREDIT` and `AMT_GOODS_PRICE` as hypothetical revenue if repaid, with a full-principal loss if defaulted. Its average break-even threshold is **`r sprintf("%.2f%%", 100 * spread_break_even_threshold)`**. On eligible out-of-fold rows, it yields an approval rate of **`r sprintf("%.1f%%", 100 * spread_chosen_metrics$approval_rate)`** and net value of **USD `r sprintf("%.2f", spread_chosen_metrics$net_value_per_100_all_principal)` per USD 100 of eligible principal offered**. This is a user-proposed data proxy, not observed interest income or lender revenue.
 
 The model can help organize risk review, but it should not make automatic credit decisions. The dataset is historical and international, the target means payment difficulty rather than a universal legal definition of default, and measured group approval gaps require investigation before any operational use.
 
@@ -252,6 +327,50 @@ ggplot(sensitivity_plot, aes(x = threshold, y = value_per_100_applicants)) +
 ```
 
 The table uses observed out-of-fold outcomes to show what would have happened in this historical sample if each cutoff had been used. It does not estimate changes in applicant behavior, pricing, loan mix, or future economic conditions. The value per $100 of applicants compares the model's accepted set with an all-approved baseline; it can be negative if rejected repayers' lost contribution outweighs defaults avoided.
+
+### Alternative: application amount-to-goods-price spread
+
+The project data dictionary defines `AMT_CREDIT` as the credit amount and `AMT_GOODS_PRICE` as the price of goods for consumer loans. The proposed ratio, `(AMT_CREDIT - AMT_GOODS_PRICE) / AMT_GOODS_PRICE`, is therefore a spread per dollar of goods price. For a per-dollar-of-principal scenario, this card normalizes the spread as `(AMT_CREDIT - AMT_GOODS_PRICE) / AMT_CREDIT`. This assumes the spread is contribution if the borrower repays and assumes the entire principal is lost on default (zero recovery).
+
+| Measure | Result |
+|---|---:|
+| Applications with positive credit and goods-price values | `r format(sum(spread_valid), big.mark = ",")` |
+| Share of training applicants covered | `r sprintf("%.2f%%", 100 * mean(spread_valid))` |
+| Mean proposed spread per $1 goods-price amount | `r sprintf("%.4f", mean(spread_per_goods_dollar[spread_valid]))` |
+| Mean normalized spread per $1 credit principal | `r sprintf("%.4f", mean_spread_per_principal)` |
+| Median normalized spread per $1 credit principal | `r sprintf("%.4f", median(spread_per_principal_dollar[spread_valid]))` |
+| Break-even threshold from mean normalized spread and 100% default loss | **`r sprintf("%.2f%%", 100 * spread_break_even_threshold)`** |
+
+The proposed ratio averages **`r sprintf("%.4f", mean(spread_per_goods_dollar[spread_valid]))`** per dollar of goods price. Because the threshold's loss is defined per dollar of credit principal, the calculation uses the normalized mean of **`r sprintf("%.4f", mean_spread_per_principal)`** per dollar of principal. It follows from the same break-even equation: mean gain divided by (mean gain plus full-principal loss). The data dictionary does not define the goods-price difference as realized revenue. It may reflect loan structure and product mix; this scenario is a sensitivity case, not a validated margin estimate.
+
+```{r}
+#| label: spread-threshold-sensitivity
+
+spread_chosen_metrics |>
+  transmute(
+    `Default threshold` = sprintf("%.2f%%", 100 * threshold),
+    `Approval rate` = sprintf("%.1f%%", 100 * approval_rate),
+    `Default rate among approvals` = sprintf("%.2f%%", 100 * default_rate_approved),
+    `Default precision` = sprintf("%.1f%%", 100 * precision_default),
+    `Default recall` = sprintf("%.1f%%", 100 * recall_default),
+    `Net value per USD 100 of eligible principal offered` =
+      sprintf("USD %.2f", net_value_per_100_all_principal)
+  ) |>
+  kable(caption = "Out-of-fold results under the data-derived spread scenario")
+
+spread_sensitivity |>
+  transmute(
+    `Risk cutoff` = ifelse(is.infinite(threshold), "All approved",
+                           sprintf("%.2f%%", 100 * threshold)),
+    `Approval rate` = sprintf("%.1f%%", 100 * approval_rate),
+    `Default rate among approvals` = sprintf("%.2f%%", 100 * default_rate_approved),
+    `Net value per USD 100 of eligible principal offered` =
+      sprintf("USD %.2f", net_value_per_100_all_principal)
+  ) |>
+  kable(caption = "Threshold sensitivity using the amount-to-goods-price spread and full-principal default loss")
+```
+
+The net-value denominator is total eligible principal across the applicant sample, including declined applications; declined applications contribute zero. The comparison with approving all eligible applications is **USD `r sprintf("%.2f", spread_incremental_value)` per USD 100 of eligible principal offered**. This provides a consistent out-of-fold comparison across cutoffs but does not account for costs of capital, servicing, recovery, or differences in terms.
 
 ## Explainability and adverse-action mapping
 
@@ -370,6 +489,7 @@ The original project statement reports a historical payment-difficulty prevalenc
 ## References
 
 - Home Credit business problem statement (project-provided): objective, historical payment-difficulty rate, and project scope.
+- `HomeCredit_columns_description.csv` (project-provided data dictionary for application and supplemental fields).
 - [Home Credit Default Risk competition data](https://www.kaggle.com/c/home-credit-default-risk/data?select=application_train.csv).
 - [Federal Reserve Board, Survey of Finance Companies, 2020–21 Findings](https://www.federalreserve.gov/publications/2025-january-survey-of-finance-companies-2020-21.htm).
 - [CFPB, Consumer Credit Card Market Report (2021)](https://www.consumerfinance.gov/documents/10127/cfpb_consumer-credit-card-market-report_2021.pdf).

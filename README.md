@@ -45,7 +45,7 @@ The selected model is an unweighted XGBoost model with a maximum tree depth of 7
 
 ## Model Card
 
-[`model_card.qmd`](model_card.qmd) is the business-facing model card for the selected XGBoost model. It summarizes the model and intended use, reports cross-validated and Kaggle AUC, evaluates threshold-dependent precision, recall, approval rates and scenario-based financial outcomes, and includes SHAP feature summaries, candidate adverse-action explanations, descriptive fairness comparisons, and key limitations.
+[`model_card.qmd`](model_card.qmd) is the business-facing model card for the selected XGBoost model. It summarizes the model and intended use, reports cross-validated and Kaggle AUC, evaluates threshold-dependent precision, recall, approval rates and scenario-based financial outcomes, and includes SHAP feature summaries, candidate adverse-action explanations, descriptive fairness comparisons, and key limitations. Its decision analysis now includes both cited consumer-lending economics and an alternative, clearly labeled amount-to-goods-price spread proxy derived from the application data.
 
 The card reuses cached training predictions and model artifacts in `Model Outputs/`; it does not retrain the selected model. The threshold economics are explicitly labeled as external proxies because the project data do not contain contractual pricing, funding costs, or loan-level loss severity. Render the source after the modeling notebook has created its cached artifacts:
 
