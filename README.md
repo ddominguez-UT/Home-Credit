@@ -43,5 +43,17 @@ Gradient-boosted trees produced the best results. Several XGBoost configurations
 
 The selected model is an unweighted XGBoost model with a maximum tree depth of 7, learning rate of 0.05, minimum child weight of 20, native missing-value handling, and 350 boosting rounds. It achieved a mean five-fold ROC AUC of 0.7825, with a fold standard deviation of 0.0018. It was selected because it provided the strongest and most stable out-of-sample ranking performance while maintaining reasonable runtime. The selected workflow was subsequently refitted using all labeled training applications to generate payment-difficulty probabilities for the competition test set.
 
+## Model Card
+
+[`model_card.qmd`](model_card.qmd) is the business-facing model card for the selected XGBoost model. It summarizes the model and intended use, reports cross-validated and Kaggle AUC, evaluates threshold-dependent precision, recall, approval rates and scenario-based financial outcomes, and includes SHAP feature summaries, candidate adverse-action explanations, descriptive fairness comparisons, and key limitations.
+
+The card reuses cached training predictions and model artifacts in `Model Outputs/`; it does not retrain the selected model. The threshold economics are explicitly labeled as external proxies because the project data do not contain contractual pricing, funding costs, or loan-level loss severity. Render the source after the modeling notebook has created its cached artifacts:
+
+```sh
+quarto render model_card.qmd
+```
+
+The resulting `model_card.html` and the `Model Outputs/` directory remain local and are ignored by Git. Commit the model card source and project documentation, not generated model artifacts or submission files.
+
 
 

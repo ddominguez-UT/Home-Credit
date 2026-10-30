@@ -1,0 +1,378 @@
+---
+title: "Home Credit Default Risk: Model Card"
+subtitle: "A business-facing review of model performance, decision economics, explanations, and fairness"
+author: "Diana Dominguez"
+date: 2026-10-29
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: false
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+  freeze: auto
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("Scripts/data_preparation.R")
+source("Scripts/modeling_pipeline.R")
+
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(readr)
+
+score_path <- file.path("Model Outputs", "best_model_score_record.csv")
+oof_path <- file.path("Model Outputs", "selected_xgboost_oof_predictions_refined.rds")
+train_path <- file.path("Model Outputs", "train_model.rds")
+fit_path <- file.path("Model Outputs", "final_xgboost_fit.rds")
+required_artifacts <- c(score_path, oof_path, train_path, fit_path)
+missing_artifacts <- required_artifacts[!file.exists(required_artifacts)]
+if (length(missing_artifacts)) {
+  stop("Required cached model artifact(s) are missing: ",
+       paste(missing_artifacts, collapse = ", "),
+       ". Render Home Credit Modeling.qmd first to create them.")
+}
+
+model_record <- readr::read_csv(score_path, show_col_types = FALSE)
+oof <- readRDS(oof_path)
+train_model <- readRDS(train_path)
+final_fit <- readRDS(fit_path)
+
+if (nrow(oof) != nrow(train_model) || !identical(oof$row_id, seq_len(nrow(train_model)))) {
+  stop("Out-of-fold predictions and training rows are not aligned.")
+}
+
+truth <- as.integer(oof$truth)
+probability <- as.numeric(oof$probability)
+
+# Federal Reserve 2021 personal-loan-company portfolio figures, dollars per
+# $100 outstanding credit. The performing-loan contribution is derived as
+# before-tax income plus portfolio loan losses/reserves.
+good_loan_contribution <- 1.55 + 4.09
+# CFPB 2021 Credit Card Market Report: 17% average cumulative recovery on
+# charged-off balance for the Q1 2017 vintage; 83% unrecovered loss proxy.
+recovery_rate <- 0.17
+loss_given_default <- 1 - recovery_rate
+break_even_threshold <- good_loan_contribution /
+  (good_loan_contribution + 100 * loss_given_default)
+
+threshold_metrics <- function(threshold, labels = truth, probs = probability) {
+  predicted_default <- probs >= threshold
+  actual_default <- labels == 1L
+  tp <- sum(predicted_default & actual_default)
+  fp <- sum(predicted_default & !actual_default)
+  fn <- sum(!predicted_default & actual_default)
+  tn <- sum(!predicted_default & !actual_default)
+  approved <- !predicted_default
+  realized_value <- ifelse(labels == 1L, -100 * loss_given_default,
+                           good_loan_contribution)
+  tibble(
+    threshold = threshold,
+    approvals = sum(approved),
+    approval_rate = mean(approved),
+    default_rate_approved = if (sum(approved)) mean(labels[approved] == 1L) else NA_real_,
+    precision_default = if (tp + fp) tp / (tp + fp) else NA_real_,
+    recall_default = if (tp + fn) tp / (tp + fn) else NA_real_,
+    value_per_100_applicants = mean(ifelse(approved, realized_value, 0)),
+    false_denials = fn,
+    true_denials = tp,
+    true_approvals = tn,
+    false_approvals = fp
+  )
+}
+
+chosen_metrics <- threshold_metrics(break_even_threshold)
+approve_all_value <- mean(ifelse(truth == 1L, -100 * loss_given_default,
+                                 good_loan_contribution))
+incremental_value <- chosen_metrics$value_per_100_applicants - approve_all_value
+
+auc_oof <- roc_auc_binary(truth, probability)
+decision_metrics <- chosen_metrics |>
+  select(threshold, approval_rate, default_rate_approved,
+         precision_default, recall_default)
+
+set.seed(6812)
+shap_n <- min(1000L, nrow(train_model))
+shap_rows <- sample(seq_len(nrow(train_model)), shap_n)
+shap_frame <- train_model[shap_rows, , drop = FALSE]
+shap_x <- apply_sparse_encoder(shap_frame, final_fit$encoder)
+shap_dmatrix <- xgboost::xgb.DMatrix(shap_x, missing = NA)
+shap_contribution <- as.matrix(predict(final_fit$model, shap_dmatrix,
+                                       predcontrib = TRUE))
+if (ncol(shap_contribution) != ncol(shap_x) + 1L) {
+  stop("SHAP contribution columns do not match the encoded model features.")
+}
+shap_features <- colnames(shap_x)
+shap_values <- shap_contribution[, seq_along(shap_features), drop = FALSE]
+shap_summary <- tibble(
+  feature = shap_features,
+  mean_abs_shap = colMeans(abs(shap_values)),
+  mean_shap = colMeans(shap_values)
+) |>
+  arrange(desc(mean_abs_shap)) |>
+  slice_head(n = 15)
+
+feature_explanation <- function(feature) {
+  dplyr::case_when(
+    grepl("^EXT_SOURCE", feature) ~ "External credit score or risk indicator",
+    grepl("OWN_CAR_AGE", feature) ~ "Age of the applicant's vehicle",
+    grepl("DAYS_BIRTH|AGE", feature) ~ "Age-related application information",
+    grepl("DAYS_EMPLOYED|EMPLOY", feature) ~ "Employment history or stability",
+    grepl("AMT_CREDIT|CREDIT_TO_INCOME", feature) ~ "Requested credit amount relative to reported income",
+    grepl("AMT_ANNUITY|ANNUITY_TO_INCOME", feature) ~ "Scheduled payment relative to reported income",
+    grepl("AMT_INCOME", feature) ~ "Reported income information",
+    grepl("CODE_GENDER", feature) ~ "Recorded gender category (sensitive; requires fair-lending review)",
+    grepl("NAME_EDUCATION_TYPE", feature) ~ "Recorded education category (review for proxy effects)",
+    grepl("bureau|BUREAU", feature) ~ "Previous credit-bureau account history",
+    grepl("installment|INSTAL", feature) ~ "Repayment behavior on prior Home Credit loans",
+    grepl("previous|PREV", feature) ~ "History of previous credit applications",
+    grepl("POS|CASH", feature) ~ "Prior point-of-sale or cash-loan account history",
+    grepl("credit_card|CARD", feature) ~ "Prior credit-card account history",
+    TRUE ~ "Application or credit-history field; verify its codebook definition"
+  )
+}
+
+adverse_mapping <- shap_summary |>
+  mutate(
+    candidate_factor = vapply(feature, feature_explanation, character(1)),
+    average_model_direction = ifelse(mean_shap >= 0,
+                                     "Raised risk score on average",
+                                     "Lowered risk score on average")
+  )
+```
+
+## Executive summary
+
+**Recommendation:** Treat this model as a research and portfolio-screening prototype. Do not use its scores or the threshold below as a lending policy without current population validation, calibrated loan-level economics, legal/compliance review, and a monitored human decision process. The project business statement also defines the work as decision support rather than a final approval policy.
+
+The selected model is a five-fold cross-validated XGBoost classifier. Its pooled out-of-fold ROC AUC is **`r sprintf("%.4f", auc_oof)`**; the modeling notebook reports mean fold AUC **`r sprintf("%.4f", model_record$roc_auc_mean[1])`** (fold SD **`r sprintf("%.4f", model_record$roc_auc_sd[1])`**) and Kaggle public/private AUCs **`r sprintf("%.5f / %.5f", model_record$kaggle_public_auc[1], model_record$kaggle_private_auc[1])`**. At the illustrative cost-derived threshold of **`r sprintf("%.2f%%", 100 * break_even_threshold)`**, the out-of-fold approval rate is **`r sprintf("%.1f%%", 100 * chosen_metrics$approval_rate)`**, and the default rate among approved applicants is **`r sprintf("%.2f%%", 100 * chosen_metrics$default_rate_approved)`**.
+
+Under the stated assumptions, the observed out-of-fold portfolio value is **USD `r sprintf("%.2f per USD 100 of applicants", chosen_metrics$value_per_100_applicants)`** versus **USD `r sprintf("%.2f per USD 100 of applicants", approve_all_value)`** if every applicant were approved. The difference is **USD `r sprintf("%.2f per USD 100 of applicants", incremental_value)`**. These are historical backtest quantities using broad U.S. consumer-finance proxies, not forecasts for Home Credit. The data have no contractual pricing, term, funding costs, or loss severity for the scored loans.
+
+The model can help organize risk review, but it should not make automatic credit decisions. The dataset is historical and international, the target means payment difficulty rather than a universal legal definition of default, and measured group approval gaps require investigation before any operational use.
+
+## Model details
+
+| Item | Description |
+|---|---|
+| Model | XGBoost binary gradient-boosted trees; objective estimates `TARGET = 1` payment-difficulty probability |
+| Project version | Final project fit (`final_xgboost_fit.rds`); no independent model registry/version tag was recorded |
+| Training data | 307,511 labeled Home Credit application records, combined with applicant-level features aggregated from bureau, previous-application, installment, POS/cash, and credit-card histories |
+| Validation | Five fixed stratified folds; preprocessing was fit within each training fold. Pooled out-of-fold probabilities are used for threshold and fairness analyses |
+| Hyperparameters | `max_depth = 7`, `eta = 0.05`, `min_child_weight = 20`, `subsample = 0.85`, `colsample_bytree = 0.85`, `nrounds = 350`, native missing-value handling, no class weighting |
+| Data source | [Home Credit Default Risk competition data](https://www.kaggle.com/c/home-credit-default-risk/data?select=application_train.csv) |
+
+The Kaggle competition describes `application_train.csv` as one row per loan application and includes linked previous credit-bureau and repayment-history tables. The source is useful for this project but is not a substitute for a lender's current, representative application and performance data.
+
+## Intended use
+
+The model is intended for retrospective analysis of payment-difficulty patterns and for demonstrating how risk ranking, decision thresholds, explanations, and approval rates can be assessed together. A qualified analyst could use it to prioritize applications for further review in a controlled validation exercise.
+
+It is not designed to determine eligibility, set loan terms or prices, replace an underwriting process, or serve as a sole basis for a credit decision. It has not been validated on current Home Credit applicants, a U.S. applicant population, or a live lending process.
+
+## Performance metrics
+
+ROC AUC evaluates whether applicants with payment difficulty tend to receive higher risk scores. Precision and recall below describe `TARGET = 1` at the selected decision threshold. Precision is the fraction of applicants flagged as higher risk who experienced payment difficulty; recall is the fraction of all payment-difficulty cases flagged.
+
+| Evaluation | ROC AUC |
+|---|---:|
+| Pooled out-of-fold predictions (this card) | `r sprintf("%.4f", auc_oof)` |
+| Five-fold mean (model selection notebook) | `r sprintf("%.4f (SD %.4f)", model_record$roc_auc_mean[1], model_record$roc_auc_sd[1])` |
+| Kaggle public leaderboard | `r sprintf("%.5f", model_record$kaggle_public_auc[1])` |
+| Kaggle private leaderboard | `r sprintf("%.5f", model_record$kaggle_private_auc[1])` |
+
+The Kaggle scores are competition results for the unlabeled test set, not a prospective production evaluation. The public score is based on a subset; the private score is the competition's final hidden-outcome score. The threshold metrics use only out-of-fold training predictions.
+
+```{r}
+#| label: threshold-metrics
+
+decision_metrics |>
+  transmute(
+    `Default threshold` = sprintf("%.2f%%", 100 * threshold),
+    `Approval rate` = sprintf("%.1f%%", 100 * approval_rate),
+    `Default rate among approvals` = sprintf("%.2f%%", 100 * default_rate_approved),
+    `Default precision` = sprintf("%.1f%%", 100 * precision_default),
+    `Default recall` = sprintf("%.1f%%", 100 * recall_default)
+  ) |>
+  kable(caption = "Pooled out-of-fold performance at the illustrative threshold")
+```
+
+## Decision threshold and business assumptions
+
+An applicant is approved in the backtest when predicted payment-difficulty probability is below the threshold. The base scenario compares two outcomes per $100 of outstanding credit:
+
+| Assumption | Base value | Evidence and interpretation |
+|---|---:|---|
+| Contribution for a repaid loan | $5.64 | Derived from the Federal Reserve's 2021 personal-loan-company table: $1.55 before-tax income plus $4.09 loan losses/reserves per $100 outstanding. Adding back portfolio loan-loss expense approximates income before credit losses if the loan repays. |
+| Recovery after charge-off | 17% | CFPB reported an average cumulative recovery of 17% of charged-off balance over four years for the Q1 2017 credit-card vintage. Used as a broad recovery proxy; the product and market differ from Home Credit. |
+| Loss given default | $83 per $100 | `100 × (1 − 17% recovery)`; excludes timing and any additional servicing or collection costs not represented in the recovery statistic. |
+
+The Federal Reserve figures are observed U.S. finance-company portfolio data, not a guaranteed return on an individual performing loan. The recovery assumption is from credit cards because an equivalent Home Credit installment-loan recovery measure is not available here. These are explicit scenario inputs, not facts about the Kaggle loans. See the [Federal Reserve Survey of Finance Companies](https://www.federalreserve.gov/publications/2025-january-survey-of-finance-companies-2020-21.htm) and the [CFPB Consumer Credit Card Market Report](https://www.consumerfinance.gov/documents/10127/cfpb_consumer-credit-card-market-report_2021.pdf). The Fed's [consumer-loan charge-off series](https://fred.stlouisfed.org/series/CORCACBS) is net of recoveries and is context on portfolio losses, not an individual loss-given-default estimate.
+
+With approval value `G = $5.64` when the borrower repays and default loss `L = $83`, approval has nonnegative expected value when `(1 - p)G - pL >= 0`. The implied threshold is **`r sprintf("%.2f%%", 100 * break_even_threshold)`**. Applicants whose predicted risk meets or exceeds this value are declined in the illustrative backtest. This does not select a legally or operationally appropriate lending cutoff.
+
+```{r}
+#| label: threshold-sensitivity
+
+threshold_grid <- sort(unique(c(seq(0.02, 0.20, by = 0.02), break_even_threshold, 1)))
+sensitivity <- bind_rows(lapply(threshold_grid, threshold_metrics)) |>
+  arrange(threshold)
+sensitivity_plot <- sensitivity |>
+  filter(threshold <= 0.20)
+
+sensitivity |>
+  transmute(
+    `Risk cutoff` = sprintf("%.2f%%", 100 * threshold),
+    `Approval rate` = sprintf("%.1f%%", 100 * approval_rate),
+    `Default rate among approvals` = sprintf("%.2f%%", 100 * default_rate_approved),
+    `Value per $100 applicants` = sprintf("$%.2f", value_per_100_applicants)
+  ) |>
+  kable(caption = "Out-of-fold sensitivity across decision thresholds")
+
+ggplot(sensitivity_plot, aes(x = threshold, y = value_per_100_applicants)) +
+  geom_line(color = "#176B87", linewidth = 1) +
+  geom_point(color = "#176B87", size = 2) +
+  geom_vline(xintercept = break_even_threshold, linetype = "dashed",
+             color = "#B14D36") +
+  labs(
+    title = "Observed backtest value changes with the approval threshold",
+    subtitle = "Declined applicants contribute zero; applicants are normalized to $100 principal",
+    x = "Predicted payment-difficulty cutoff",
+    y = "Value per $100 of applicants"
+  ) +
+  scale_x_continuous(labels = scales::label_percent(accuracy = 1)) +
+  theme_minimal(base_size = 11)
+```
+
+The table uses observed out-of-fold outcomes to show what would have happened in this historical sample if each cutoff had been used. It does not estimate changes in applicant behavior, pricing, loan mix, or future economic conditions. The value per $100 of applicants compares the model's accepted set with an all-approved baseline; it can be negative if rejected repayers' lost contribution outweighs defaults avoided.
+
+## Explainability and adverse-action mapping
+
+SHAP contributions were calculated on a deterministic 1,000-row training sample using the final fitted XGBoost model. The plot ranks encoded features by mean absolute contribution to model output. Positive average contributions raise the model's risk score on average; negative contributions lower it. SHAP describes model behavior, not causal effects.
+
+```{r}
+#| label: shap-summary
+
+ggplot(shap_summary, aes(x = reorder(feature, mean_abs_shap), y = mean_abs_shap)) +
+  geom_col(fill = "#176B87") +
+  coord_flip() +
+  labs(
+    title = "Top predictive features in a 1,000-row SHAP sample",
+    x = NULL,
+    y = "Mean absolute SHAP contribution (model output scale)"
+  ) +
+  theme_minimal(base_size = 10)
+```
+
+```{r}
+#| label: adverse-action-map
+
+adverse_mapping |>
+  transmute(
+    `Model feature` = feature,
+    `Relative importance` = round(mean_abs_shap, 4),
+    `Average direction` = average_model_direction,
+    `Candidate plain-language factor` = candidate_factor
+  ) |>
+  kable(caption = "Candidate explanation map for review; not individualized reasons")
+```
+
+The table translates feature names into candidate plain-language factors. These global results do not establish why a particular applicant received a score. An actual adverse-action explanation would need to use the individual applicant's values and contributions, identify the principal factors that negatively affected that decision, and be validated for accuracy, clarity, and applicable requirements. Age- or gender-related fields and other proxy risks should not be used as denial reasons. Any feature involving gender or education in the model requires additional governance review before operational use.
+
+## Fairness analysis
+
+Approval rates are compared across the required `CODE_GENDER` and `NAME_EDUCATION_TYPE` groups at the illustrative threshold. The records are the same training rows scored out of fold, so each row's risk estimate comes from a model that did not train on that row. The analysis is descriptive; it does not adjust for applicant or loan characteristics and does not determine whether any difference is justified or legally acceptable.
+
+```{r}
+#| label: fairness
+
+fairness_data <- tibble(
+  CODE_GENDER = as.character(train_model$CODE_GENDER),
+  NAME_EDUCATION_TYPE = as.character(train_model$NAME_EDUCATION_TYPE),
+  truth = truth,
+  probability = probability,
+  approved = probability < break_even_threshold
+) |>
+  mutate(
+    CODE_GENDER = ifelse(is.na(CODE_GENDER) | !nzchar(CODE_GENDER), "Missing/unknown", CODE_GENDER),
+    NAME_EDUCATION_TYPE = ifelse(is.na(NAME_EDUCATION_TYPE) | !nzchar(NAME_EDUCATION_TYPE), "Missing/unknown", NAME_EDUCATION_TYPE)
+  )
+
+fairness_by_group <- function(data, group_name) {
+  data |>
+    group_by(group = .data[[group_name]]) |>
+    summarise(
+      applicants = n(),
+      approval_rate = mean(approved),
+      default_rate_approved = if (sum(approved)) mean(truth[approved] == 1L) else NA_real_,
+      .groups = "drop"
+    ) |>
+    mutate(
+      approval_rate_ratio_to_highest = approval_rate / max(approval_rate),
+      approval_gap_from_highest_pp = 100 * (approval_rate - max(approval_rate))
+    ) |>
+    arrange(desc(approval_rate)) |>
+    mutate(attribute = group_name, .before = 1)
+}
+
+fairness_results <- bind_rows(
+  fairness_by_group(fairness_data, "CODE_GENDER"),
+  fairness_by_group(fairness_data, "NAME_EDUCATION_TYPE")
+)
+
+gender_f_rate <- fairness_results |>
+  filter(attribute == "CODE_GENDER", group == "F") |>
+  pull(approval_rate)
+gender_m_rate <- fairness_results |>
+  filter(attribute == "CODE_GENDER", group == "M") |>
+  pull(approval_rate)
+education_gap_pp <- fairness_results |>
+  filter(attribute == "NAME_EDUCATION_TYPE") |>
+  summarise(gap = 100 * (max(approval_rate) - min(approval_rate))) |>
+  pull(gap)
+gender_gap_pp <- 100 * abs(gender_f_rate - gender_m_rate)
+
+fairness_results |>
+  transmute(
+    Attribute = attribute,
+    Group = group,
+    Applicants = applicants,
+    `Approval rate` = sprintf("%.1f%%", 100 * approval_rate),
+    `Gap from highest approval group` = sprintf("%.1f pp", approval_gap_from_highest_pp),
+    `Approval-rate ratio to highest` = sprintf("%.2f", approval_rate_ratio_to_highest),
+    `Default rate among approvals` = sprintf("%.2f%%", 100 * default_rate_approved)
+  ) |>
+  kable(caption = "Descriptive approval and repayment outcomes by group")
+```
+
+In this out-of-fold backtest, the recorded F and M gender groups have approval rates of **`r sprintf("%.1f%%", 100 * gender_f_rate)`** and **`r sprintf("%.1f%%", 100 * gender_m_rate)`**, a gap of **`r sprintf("%.1f percentage points", gender_gap_pp)`**. Education-group approval rates span **`r sprintf("%.1f percentage points", education_gap_pp)`** from highest to lowest. The table also shows very small groups, so their rates are especially uncertain. These disparities warrant review of sample size, missingness, feature use, calibration, and possible proxy effects. Education categories are not interchangeable with protected characteristics, and group comparisons alone cannot establish the source or acceptability of disparities. This analysis is not a full fairness audit.
+
+## Limitations and risks
+
+- **Historical, selected sample:** training labels come from previously originated loans. Applicants historically rejected or offered different terms are not represented in the same way, creating selection effects.
+- **Target interpretation:** `TARGET = 1` denotes the competition's payment-difficulty outcome, not necessarily a charge-off or a standardized default event.
+- **Population and time shift:** the Kaggle competition data are historical and international. Performance may not transfer to a current U.S. or Home Credit applicant population.
+- **Economics are not loan-specific:** the dataset does not include approved pricing, contractual terms, funding cost, servicing cost, net recoveries, or realized loss severity. The threshold economics are external scenario proxies.
+- **Calibration risk:** the decision analysis depends on probability calibration, but an AUC close to 0.78 only measures ranking. It does not prove that a 6% score corresponds to a 6% event rate in future applicants.
+- **Fairness and proxy risk:** the model includes demographic fields required for the assignment's group analysis. Other variables may proxy for sensitive traits. The reported group rates are descriptive and require a fuller review.
+- **Explanation limits:** global SHAP importance is sample-dependent and not causal. Feature contributions do not by themselves satisfy the need for accurate, applicant-specific reasons.
+- **Operational risk:** no production monitoring, drift response, security review, or human override process has been evaluated.
+
+The original project statement reports a historical payment-difficulty prevalence of about 8.1% and explicitly excludes setting final approval policy from project scope. That context supports using this model card as a review artifact, not a deployment authorization.
+
+## References
+
+- Home Credit business problem statement (project-provided): objective, historical payment-difficulty rate, and project scope.
+- [Home Credit Default Risk competition data](https://www.kaggle.com/c/home-credit-default-risk/data?select=application_train.csv).
+- [Federal Reserve Board, Survey of Finance Companies, 2020–21 Findings](https://www.federalreserve.gov/publications/2025-january-survey-of-finance-companies-2020-21.htm).
+- [CFPB, Consumer Credit Card Market Report (2021)](https://www.consumerfinance.gov/documents/10127/cfpb_consumer-credit-card-market-report_2021.pdf).
+- [Federal Reserve consumer-loan charge-off series (FRED CORCACBS)](https://fred.stlouisfed.org/series/CORCACBS).
+- [Mitchell et al., Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993).
+- [Hugging Face model card documentation](https://huggingface.co/docs/hub/en/model-cards), [Google DeepMind model cards](https://deepmind.google/models/model-cards/), and [OpenAI GPT-4o System Card](https://openai.com/index/gpt-4o-system-card/).
