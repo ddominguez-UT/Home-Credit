@@ -1,0 +1,138 @@
+---
+title: "Why We Selected the Home Credit Risk Model"
+subtitle: "A plain-language summary of the original XGBoost submission"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+---
+
+::: {.callout-note title="Historical model and clean rerun"}
+This summary describes the original 350-round model and its Kaggle submission.
+A clean run with explicit seed 6812 selected a 525-round model at 0.78265 mean
+five-fold AUC. That new fit has not been scored on Kaggle. See
+[REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the clean-run record.
+:::
+
+## Recommendation
+
+**Keep the current XGBoost model as the project's research model.** It was the
+best performer among the models tested on the same data and validation folds.
+Its score on Kaggle's hidden test applicants was close to its cross-validation
+score, which gives additional evidence that it can rank new applicants by risk.
+It is suitable for analysis and a controlled review process, but further work is
+needed before it could support real lending decisions.
+
+## What the model does
+
+The model gives each loan application a score for the chance of **payment
+difficulty** (`TARGET = 1`). A higher score means the applicant is ranked as
+more likely to have difficulty. The score is a way to prioritize review; it is
+not an automatic approve-or-decline decision. The competition outcome is
+payment difficulty, which is not necessarily the same as a loan charge-off or
+financial loss.
+
+The model learned from **307,511 labeled applications**. It uses the current
+application plus summarized information from six Home Credit history tables:
+`bureau`, `bureau_balance`, `previous_application`, `installments_payments`,
+`POS_CASH_balance`, and `credit_card_balance`. This gives it more information
+about past borrowing and repayment behavior than an application-only model.
+About **8.07%** of the labeled applications have the payment-difficulty outcome,
+so simply calling everyone low risk would appear accurate while doing little to
+identify higher-risk applicants.
+
+## Evidence for selecting XGBoost
+
+All candidates in this project were evaluated on the **same five stratified
+cross-validation folds**. In each fold, preparation steps that learn from data
+were fitted on the training portion and then applied to the held-out portion.
+This makes the model comparison more dependable.
+
+| Model tested in this project | Mean cross-validated ROC AUC |
+|---|---:|
+| Constant-score baseline | 0.5000 |
+| Pruned decision tree | 0.6528 |
+| Random forest | 0.7504 |
+| Elastic-net logistic regression | 0.7629 |
+| **Selected XGBoost** | **0.7825** |
+
+*ROC AUC* measures how well a model places applicants with payment difficulty
+above applicants without it. A score of 0.50 is no better than random ranking;
+higher is better. XGBoost exceeded the next-best model, elastic-net logistic
+regression, by **0.0196 AUC** on these folds. Its fold-to-fold standard deviation
+was **0.0018**. This is evidence for choosing XGBoost **within the set of models
+tested here**; it does not prove that no other algorithm could do better.
+
+The final model uses **350 boosting rounds**, trees with a maximum depth of
+**7**, and a learning rate of **0.05**. It lets XGBoost use missing values
+directly. In the project experiments, that worked better than filling every
+numeric gap with a median. Adding class weights reduced ranking performance and
+worsened probability error. Increasing the leading configuration from 350 to
+525 rounds did not improve validation performance, so the 350-round version was
+retained.
+
+## Check on applicants outside model selection
+
+After selection, the model was refitted on all labeled applications and scored
+Kaggle's separate test applicants, whose outcomes were hidden from the project:
+
+| Evaluation | ROC AUC |
+|---|---:|
+| Five-fold cross-validation mean | 0.7825 |
+| Kaggle public test subset | 0.78617 |
+| **Kaggle private test subset** | **0.77982** |
+
+The private score is only **about 0.003** below the cross-validation mean. The
+similar scores support the conclusion that the validation result was a useful
+estimate for this competition. They do not measure performance on today's loan
+applicants or in a live lending process.
+
+### Context from the three linked projects
+
+The linked READMEs also report XGBoost as their selected model. Their Kaggle
+private scores provide a common competition reference, though each project uses
+different features and validation steps. The figures below are the projects'
+reported results; they were not reproduced for this summary.
+
+| Project | History tables used for its selected model | Reported Kaggle private ROC AUC |
+|---|---|---:|
+| [Silva](https://github.com/aadssilva/home-credit-project/blob/main/README.md) | None; application only | 0.74116 |
+| [Jackson](https://github.com/bradynjackson/home-credit-default-risk/blob/main/README.md) | None; application only | 0.75817 |
+| [Hoopes](https://github.com/HoopesJake11/home-credit-project/blob/main/README.md) | `bureau` | 0.75276 |
+| **Current project** | Six history tables listed above | **0.77982** |
+
+The current project has the highest reported private score in this group. The
+comparison does **not** show how much of the difference comes from the extra
+tables, feature engineering, or model settings.
+
+## What still needs review
+
+- **Probability accuracy:** ROC AUC measures ranking, not whether a predicted
+  risk such as 10% will correspond to a 10% event rate in future applicants.
+  The project has an out-of-fold calibration check, but future-population
+  calibration remains unverified.
+- **Fairness and explanations:** The model uses demographic fields and external
+  scores whose construction is not documented in the competition data. Group
+  outcomes, feature use, and applicant-specific explanations need further review.
+- **Business value:** The dataset does not provide the actual pricing, funding
+  costs, or realized loan losses needed to verify a profit-maximizing approval
+  threshold. Financial examples in the model card are scenarios, not measured
+  returns.
+- **Transfer to real lending:** The historical competition applicants may differ
+  from current applicants. Results on rejected applicants cannot be measured
+  directly from these data.
+
+**Selection decision:** Use this XGBoost model as the strongest **tested research
+benchmark** for risk ranking. Before considering operational use, compare any
+new candidate on the same folds and features, validate probabilities and group
+outcomes on a representative population, and review whether the model's inputs
+and explanations are appropriate for lending decisions.
+
+## Project sources
+
+- [Home Credit Modeling.qmd](Home%20Credit%20Modeling.qmd): model comparison,
+  selected settings, cross-validation, and Kaggle results.
+- [README.md](README.md): project workflow and selected-model summary.
+- [model_card.qmd](model_card.qmd): intended use, calibration, fairness,
+  decision scenarios, and limitations.

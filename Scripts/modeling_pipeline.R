@@ -398,7 +398,7 @@ predict_xgboost_best <- function(fit, newdata, best_iteration) {
 cross_validate_xgboost <- function(data, fold_id, grid = default_xgboost_grid(),
                                    target_col = "TARGET", id_col = "SK_ID_CURR",
                                    rare_proportion = 0.001, nthread = 2L,
-                                   early_stopping_rounds = 30L) {
+                                   early_stopping_rounds = 30L, seed = 6812L) {
   check_modeling_packages()
   y <- data[[target_col]]
   results <- list()
@@ -425,7 +425,8 @@ cross_validate_xgboost <- function(data, fold_id, grid = default_xgboost_grid(),
           min_child_weight = grid$min_child_weight[grid_row],
           subsample = grid$subsample[grid_row],
           colsample_bytree = grid$colsample_bytree[grid_row],
-          scale_pos_weight = weight, nthread = nthread
+          scale_pos_weight = weight, nthread = nthread,
+          seed = as.integer(seed)
         )
         fit <- xgboost::xgb.train(
           params = parameters, data = d_analysis,
@@ -470,7 +471,7 @@ cross_validated_xgboost_predictions <- function(data, fold_id, configuration,
                                                 id_col = "SK_ID_CURR",
                                                 rare_proportion = 0.001,
                                                 nthread = 2L,
-                                                early_stopping_rounds = 30L) {
+                                                early_stopping_rounds = 30L, seed = 6812L) {
   y <- data[[target_col]]
   probability <- rep(NA_real_, nrow(data))
   iterations <- integer(length(unique(fold_id)))
@@ -502,7 +503,7 @@ cross_validated_xgboost_predictions <- function(data, fold_id, configuration,
         subsample = as.numeric(configuration$subsample[1]),
         colsample_bytree = as.numeric(configuration$colsample_bytree[1]),
         scale_pos_weight = imbalance_multiplier(y[analysis], as.character(configuration$class_weight[1])),
-        nthread = nthread
+        nthread = nthread, seed = as.integer(seed)
       ),
       data = d_analysis, nrounds = maximum_rounds,
       evals = list(validation = d_assessment),
@@ -541,7 +542,8 @@ calibration_table <- function(truth, probability, groups = 10L) {
 # randomForest package for this dataset.
 cross_validate_xgboost_forest <- function(data, fold_id, target_col = "TARGET",
                                           id_col = "SK_ID_CURR", trees = 100L,
-                                          max_depth = 8L, nthread = 2L) {
+                                          max_depth = 8L, nthread = 2L,
+                                          seed = 6812L) {
   y <- data[[target_col]]
   results <- list()
   for (fold in sort(unique(fold_id))) {
@@ -556,7 +558,8 @@ cross_validate_xgboost_forest <- function(data, fold_id, target_col = "TARGET",
       params = list(
         objective = "binary:logistic", eval_metric = "auc", tree_method = "hist",
         num_parallel_tree = trees, max_depth = max_depth, eta = 1,
-        subsample = 0.70, colsample_bynode = 0.70, nthread = nthread
+        subsample = 0.70, colsample_bynode = 0.70, nthread = nthread,
+        seed = as.integer(seed)
       ),
       data = d_analysis, nrounds = 1, verbose = 0
     )
@@ -588,7 +591,8 @@ select_best_configuration <- function(cv_results) {
 # probabilities in the exact original application_test row order.
 fit_final_xgboost <- function(train_data, test_data, configuration,
                               target_col = "TARGET", id_col = "SK_ID_CURR",
-                              final_nrounds = NULL, nthread = 2L) {
+                              final_nrounds = NULL, nthread = 2L,
+                              seed = 6812L) {
   y <- train_data[[target_col]]
   imputation <- as.character(configuration$numeric_imputation[1])
   encoder <- fit_sparse_encoder(train_data, target_col, id_col,
@@ -612,7 +616,7 @@ fit_final_xgboost <- function(train_data, test_data, configuration,
       subsample = as.numeric(configuration$subsample[1]),
       colsample_bytree = as.numeric(configuration$colsample_bytree[1]),
       scale_pos_weight = imbalance_multiplier(y, as.character(configuration$class_weight[1])),
-      nthread = nthread
+      nthread = nthread, seed = as.integer(seed)
     ),
     data = d_train, nrounds = rounds, verbose = 0
   )

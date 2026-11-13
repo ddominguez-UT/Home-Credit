@@ -45,12 +45,13 @@ The modeling data combines the current application fields with applicant-level
 history aggregated from the bureau, previous-application, installment, POS cash,
 and credit-card tables. Model flexibility was increased gradually so that the
 performance benefit of nonlinear relationships and interactions could be judged
-against simpler benchmarks. The pruned decision tree achieved a mean
+against simpler benchmarks. In the earlier project run, the pruned decision
+tree achieved a mean
 cross-validated ROC AUC of 0.6528, the random forest achieved 0.7504, and the
 elastic-net logistic regression achieved 0.7629. XGBoost performed best at
 0.7825 (fold standard deviation 0.0018).
 
-The final XGBoost model uses depth 7, a learning rate of 0.05, minimum child
+That earlier XGBoost model uses depth 7, a learning rate of 0.05, minimum child
 weight of 20, native missing-value routing, no class weighting, and 350 boosting
 rounds. Native missing handling outperformed median imputation, class weighting
 reduced AUC and worsened probability error, and extending the model to 525
@@ -74,12 +75,13 @@ library(readr)
 
 check_modeling_packages()
 
+# Use the same seed for fold assignment and every XGBoost training call.
 SEED <- 6812L
 CV_FOLDS <- 5L
 NTHREAD <- 4L
 
-# Scores returned by Kaggle for home_credit_submission.csv. The private score
-# is the final external evaluation; the public score is a preliminary subset.
+# Historical Kaggle scores for the previously submitted file. A newly refitted
+# model must be submitted again before these scores can describe that new fit.
 KAGGLE_PUBLIC_AUC <- 0.78617
 KAGGLE_PRIVATE_AUC <- 0.77982
 
@@ -88,9 +90,12 @@ KAGGLE_PRIVATE_AUC <- 0.77982
 # exceed 2 GB in total.
 USE_SUPPLEMENTAL <- TRUE
 
-# Set FORCE_REFIT to TRUE only when data, features, folds, or tuning grids change.
+# Set FORCE_REFIT to TRUE when data, features, folds, tuning grids, or training
+# settings (including the XGBoost seed) change. Existing caches predate the
+# explicit XGBoost seed and must be refitted to verify the seeded model.
 FORCE_REFIT <- FALSE
-OUTPUT_DIR <- "Model Outputs"
+OUTPUT_DIR <- Sys.getenv("HOME_CREDIT_OUTPUT_DIR", unset = "Model Outputs")
+if (!nzchar(OUTPUT_DIR)) stop("HOME_CREDIT_OUTPUT_DIR must not be empty.")
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 cached_result <- function(path, expression, force_refit = FORCE_REFIT) {
@@ -109,16 +114,23 @@ package_versions <- data.frame(
 kable(package_versions, caption = "Modeling package versions")
 ```
 
-The seed, folds, and thread count are declared once. Intermediate results are
-cached so the document can be rendered repeatedly without refitting unchanged
-models. Four threads provide a practical balance between speed and leaving the
-computer responsive.
+The seed, folds, and thread count are declared once. The same seed is passed to
+each XGBoost fit, including the random-forest benchmark and the final model.
+Intermediate results are cached so the document can be rendered repeatedly
+without refitting unchanged models. Four threads provide a practical balance
+between speed and leaving the computer responsive.
+
+Set `HOME_CREDIT_OUTPUT_DIR` to write a clean run to a separate folder. If it is
+not set, the notebook uses `Model Outputs` as before.
 
 ::: {.callout-note title="Runtime and cached results"}
 The first complete run is intentionally the slowest because it builds historical
 aggregates and cross-validates every candidate. Later renders reuse files in
-`Model Outputs`. Set `FORCE_REFIT <- TRUE` only after changing the data, folds,
-features, or tuning grids.
+`Model Outputs`. Set `FORCE_REFIT <- TRUE` after changing data, folds,
+features, tuning grids, or the training seed. A normal render uses existing
+cached fits, which may have been trained before the explicit seed was added.
+For a full independent check, render from a clean copy with an empty
+`Model Outputs` directory.
 :::
 
 ## 2. Load application and historical data
@@ -314,7 +326,8 @@ is expected to rank applicants more accurately.
 forest_results <- cached_result(
   file.path(OUTPUT_DIR, "cv_xgboost_forest.rds"),
   cross_validate_xgboost_forest(
-    train_model, fold_id, trees = 100L, max_depth = 8L, nthread = NTHREAD
+    train_model, fold_id, trees = 100L, max_depth = 8L,
+    nthread = NTHREAD, seed = SEED
   )
 )
 forest_summary <- summarize_cv_results(forest_results)
@@ -338,7 +351,7 @@ xgb_results <- cached_result(
   file.path(OUTPUT_DIR, "cv_xgboost_initial.rds"),
   cross_validate_xgboost(
     train_model, fold_id, xgb_grid,
-    nthread = NTHREAD, early_stopping_rounds = 30L
+    nthread = NTHREAD, early_stopping_rounds = 30L, seed = SEED
   )
 )
 xgb_summary <- summarize_cv_results(xgb_results)
@@ -373,7 +386,7 @@ refinement_results <- cached_result(
   file.path(OUTPUT_DIR, "cv_xgboost_refinement.rds"),
   cross_validate_xgboost(
     train_model, fold_id, refinement_grid,
-    nthread = NTHREAD, early_stopping_rounds = 30L
+    nthread = NTHREAD, early_stopping_rounds = 30L, seed = SEED
   )
 )
 refinement_summary <- summarize_cv_results(refinement_results)
@@ -411,7 +424,7 @@ imbalance_results <- cached_result(
   file.path(OUTPUT_DIR, "cv_xgboost_imbalance_refined.rds"),
   cross_validate_xgboost(
     train_model, fold_id, imbalance_grid,
-    nthread = NTHREAD, early_stopping_rounds = 30L
+    nthread = NTHREAD, early_stopping_rounds = 30L, seed = SEED
   )
 )
 
@@ -475,10 +488,10 @@ best_model_record <- best_xgb |>
   mutate(
     selected_on = Sys.Date(),
     selection_metric = "Five-fold cross-validated ROC AUC",
-    external_test_auc = KAGGLE_PRIVATE_AUC,
+    external_test_auc = NA_real_,
     kaggle_public_auc = KAGGLE_PUBLIC_AUC,
     kaggle_private_auc = KAGGLE_PRIVATE_AUC,
-    external_test_status = "Kaggle late submission scored successfully"
+    external_test_status = "Historical Kaggle submission; rescore after a seeded refit"
   )
 
 write_csv(best_model_record,
@@ -488,16 +501,22 @@ kable(best_model_record, digits = 4,
 ```
 
 The internal score records performance across the fixed cross-validation folds.
-Kaggle evaluated the submitted probabilities against hidden test outcomes and
-returned a public AUC of 0.78617 and a private AUC of 0.77982. The private score
-is treated as the final external result because it is calculated on the hidden
-private leaderboard subset.
+Kaggle evaluated the earlier submitted probabilities against hidden test
+outcomes and returned a public AUC of 0.78617 and a private AUC of 0.77982.
+The private score is the final external result for that historical submission.
+
+::: {.callout-warning title="Kaggle score after a seeded refit"}
+The Kaggle figures above are from the earlier submitted file. After retraining
+with the explicit XGBoost seed, submit the newly generated
+`home_credit_submission.csv` to verify the new fit. Until then, the historical
+Kaggle scores are not an evaluation of the seeded fit.
+:::
 
 ::: {.callout-note title="Internal and external AUC results"}
-The mean cross-validation AUC was 0.7825. Kaggle reported 0.78617 on the public
-subset and 0.77982 on the private subset. Their close agreement indicates that
-the fixed-fold validation design provided a credible estimate of performance on
-previously unseen applicants.
+The earlier run's mean cross-validation AUC was 0.7825. Kaggle reported 0.78617
+on the public subset and 0.77982 on the private subset. Their close agreement
+indicated that the fixed-fold validation design gave a useful estimate for that
+historical submission. A clean refit needs its own external score.
 :::
 
 ```{r}
@@ -517,7 +536,7 @@ selected_grid <- data.frame(
 oof_predictions <- cached_result(
   file.path(OUTPUT_DIR, "selected_xgboost_oof_predictions_refined.rds"),
   cross_validated_xgboost_predictions(
-    train_model, fold_id, selected_grid, nthread = NTHREAD
+    train_model, fold_id, selected_grid, nthread = NTHREAD, seed = SEED
   )
 )
 
@@ -560,7 +579,7 @@ final_fit <- cached_result(
   fit_final_xgboost(
     train_model, test_model, best_xgb,
     final_nrounds = max(1L, as.integer(round(best_xgb$best_iteration_mean))),
-    nthread = NTHREAD
+    nthread = NTHREAD, seed = SEED
   )
 )
 
@@ -603,8 +622,8 @@ values.
 cat(sprintf(
   paste0(
     "The selected model is %s (%s). Its mean five-fold ROC AUC is %.4f ",
-    "with a fold standard deviation of %.4f. Kaggle public and private AUCs ",
-    "are %.5f and %.5f, respectively. The submission file is %s."
+    "with a fold standard deviation of %.4f. Historical Kaggle public and ",
+    "private AUCs are %.5f and %.5f, respectively. The submission file is %s."
   ),
   best_xgb$model, best_xgb$config,
   best_xgb$roc_auc_mean, best_xgb$roc_auc_sd,
@@ -613,7 +632,7 @@ cat(sprintf(
 ))
 ```
 
-The private Kaggle AUC of 0.77982 is the final external score. It is 0.00266
+For the earlier submission, the private Kaggle AUC of 0.77982 was 0.00266
 below the mean cross-validation AUC of 0.78248, a small difference consistent
 with ordinary sampling variation. The public AUC is slightly higher at 0.78617.
 Both external results are retained alongside—not substituted for—the

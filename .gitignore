@@ -19,6 +19,7 @@ cache/
 tmp/
 .quarto-cache/
 Model Outputs/
+Model Outputs Reproduction/
 *.zip
 *.html
 *_files/

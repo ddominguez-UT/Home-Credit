@@ -1,4 +1,8 @@
 # Home Credit Default Risk Project
+
+For the exact data inputs, software versions, clean-run steps, and output checks
+used to reproduce the modeling results, see [REPRODUCIBILITY.md](REPRODUCIBILITY.md).
+
 This project analyzes Home Credit application and historical credit data to identify patterns associated with payment difficulty. Home Credit serves customers who may have limited access to traditional credit, making it important to assess repayment risk while avoiding unnecessary exclusion of applicants who may be able to repay.
 
 The analysis uses the application training dataset, which includes the documented payment-difficulty outcome (TARGET), and the application test dataset, which has the same applicant characteristics but does not include the outcome. Supplementary tables provide historical information on bureau credit records, prior loan applications, installment payments, POS cash activity, and credit-card balances.
@@ -49,6 +53,8 @@ The analysis begins with a null model and then evaluates progressively more flex
 Gradient-boosted trees produced the best results. Several XGBoost configurations were evaluated by varying tree depth, learning rate, child-size regularization, missing-data treatment, class weighting, and number of boosting rounds. Native missing-value handling outperformed median imputation, suggesting that the pattern of missing information contains useful predictive signal. Class weighting did not improve AUC and substantially worsened probability error, so it was not used in the final model. Extending the leading model from 350 to 525 rounds also failed to improve validation performance.
 
 The selected model is an unweighted XGBoost model with a maximum tree depth of 7, learning rate of 0.05, minimum child weight of 20, native missing-value handling, and 350 boosting rounds. It achieved a mean five-fold ROC AUC of 0.7825, with a fold standard deviation of 0.0018. It was selected because it provided the strongest and most stable out-of-sample ranking performance while maintaining reasonable runtime. The selected workflow was subsequently refitted using all labeled training applications to generate payment-difficulty probabilities for the competition test set.
+
+That 350-round result is the historical submission. A clean run with explicit seed 6812 selected a 525-round XGBoost fit with mean five-fold AUC 0.78265. This newer fit has not been scored by Kaggle; see [REPRODUCIBILITY.md](REPRODUCIBILITY.md).
 
 ## Model Card
 
